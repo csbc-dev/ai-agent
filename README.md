@@ -10,7 +10,7 @@ It is an **I/O node** that connects LLM inference to reactive state — with fir
 
 This means chat UIs and AI-powered features can be expressed declaratively, without writing fetch calls, SSE parsing, token management, or streaming glue code in your UI layer.
 
-`@csbc-dev/ai-agent` follows the [CSBC (Core/Shell Bindable Component)](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/packages/hawc/README.md) architecture:
+`@csbc-dev/ai-agent` follows the [CSBC (Core/Shell Bindable Component)](https://github.com/csbc-dev/arch/blob/main/README.md) architecture:
 
 - **Core** (`AiCore`) handles provider abstraction, streaming, and conversation state
 - **Shell** (`<ai-agent>`) is a thin, command-mediating browser surface: it exposes bindable state locally, forwards commands to the Core, and can proxy a remote Core over the wire
