@@ -1,8 +1,5 @@
 {
   "permissions": {
-    "allow": [
-      "Read(//c/Users/kikuzawa/Documents/git/wc-bindable-protocol/wc-bindable-protocol/docs/**)",
-      "Read(//c/Users/kikuzawa/Documents/git/wc-bindable-protocol/wc-bindable-protocol/**)"
-    ]
+    "allow": []
   }
 }
