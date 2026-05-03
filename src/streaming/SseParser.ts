@@ -50,7 +50,15 @@ export class SseParser {
     return results;
   }
 
-  /** Flush any buffered but unterminated event (e.g. stream closed without trailing empty line). */
+  /**
+   * Flush any buffered but unterminated event (e.g. stream closed without a
+   * trailing empty line).
+   *
+   * The parser is reusable after `flush()`: internal `_buffer`,
+   * `_currentEvent`, and `_currentData` are reset so a subsequent `feed()`
+   * call starts from a clean state. This lets a long-lived parser instance
+   * be drained between connections without being reconstructed.
+   */
   flush(): SseEvent | null {
     // Process any remaining partial line left in _buffer. Strip a trailing
     // CR so `data: hello\r` (no LF/CRLF) still parses the same as LF-only.

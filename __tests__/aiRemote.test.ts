@@ -1194,4 +1194,109 @@ describe("Ai (remote mode)", () => {
       cleanup();
     });
   });
+
+  describe("forwardCredentials", () => {
+    it("デフォルト(false)時はsendペイロードからapiKey/baseUrl/apiVersionを除外する", async () => {
+      const { el, cleanup } = createRemoteAi();
+
+      const invokeSpy = vi.fn().mockResolvedValue("ok");
+      (el as any)._proxy.invokeWithOptions = invokeSpy;
+
+      el.setAttribute("api-key", "should-not-leak");
+      el.setAttribute("base-url", "https://leaky.example/");
+      el.setAttribute("api-version", "1234-05-06");
+      el.prompt = "Hello";
+      el.setAttribute("model", "gpt-4o");
+
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await el.send();
+      } finally {
+        errorSpy.mockRestore();
+      }
+
+      expect(invokeSpy).toHaveBeenCalledTimes(1);
+      const [cmd, args] = invokeSpy.mock.calls[0];
+      expect(cmd).toBe("send");
+      const [, options] = args;
+      expect(options).not.toHaveProperty("apiKey");
+      expect(options).not.toHaveProperty("baseUrl");
+      expect(options).not.toHaveProperty("apiVersion");
+
+      cleanup();
+    });
+
+    it("forwardCredentials=trueならsendペイロードにapiKey/baseUrl/apiVersionを含める", async () => {
+      const { el, cleanup } = createRemoteAi();
+
+      const invokeSpy = vi.fn().mockResolvedValue("ok");
+      (el as any)._proxy.invokeWithOptions = invokeSpy;
+
+      el.forwardCredentials = true;
+      el.setAttribute("api-key", "sk-trusted");
+      el.setAttribute("base-url", "https://proxy.example");
+      el.setAttribute("api-version", "2024-01-01");
+      el.prompt = "Hello";
+      el.setAttribute("model", "gpt-4o");
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await el.send();
+      } finally {
+        warnSpy.mockRestore();
+      }
+
+      expect(invokeSpy).toHaveBeenCalledTimes(1);
+      const [, args] = invokeSpy.mock.calls[0];
+      const [, options] = args;
+      expect(options.apiKey).toBe("sk-trusted");
+      expect(options.baseUrl).toBe("https://proxy.example");
+      expect(options.apiVersion).toBe("2024-01-01");
+
+      cleanup();
+    });
+
+    it("apiKey設定済みでforwardCredentialsオフのときはconsole.errorを1回だけ出す", async () => {
+      const { el, cleanup } = createRemoteAi();
+
+      const invokeSpy = vi.fn().mockResolvedValue("ok");
+      (el as any)._proxy.invokeWithOptions = invokeSpy;
+
+      el.setAttribute("api-key", "should-not-leak");
+      el.prompt = "Hello";
+      el.setAttribute("model", "gpt-4o");
+
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let callCount = 0;
+      try {
+        await el.send();
+        await el.send();
+        await el.send();
+        callCount = errorSpy.mock.calls.length;
+      } finally {
+        errorSpy.mockRestore();
+      }
+
+      expect(callCount).toBe(1);
+      cleanup();
+    });
+
+    it("forward-credentials属性のtrue/false文字列を正しく解釈する", () => {
+      const { el, cleanup } = createRemoteAi();
+
+      el.setAttribute("forward-credentials", "true");
+      expect(el.forwardCredentials).toBe(true);
+
+      el.setAttribute("forward-credentials", "false");
+      expect(el.forwardCredentials).toBe(false);
+
+      el.setAttribute("forward-credentials", "");
+      expect(el.forwardCredentials).toBe(true); // 属性のみ存在 = true
+
+      el.removeAttribute("forward-credentials");
+      expect(el.forwardCredentials).toBe(false);
+
+      cleanup();
+    });
+  });
 });

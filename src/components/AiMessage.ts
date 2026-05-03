@@ -1,4 +1,4 @@
-const KNOWN_ROLES = new Set(["system", "user", "assistant"]);
+const KNOWN_ROLES = new Set(["system", "user", "assistant", "tool"]);
 let _warnedRoleTypos: Set<string> | undefined;
 
 function isDevelopment(): boolean {
@@ -11,7 +11,7 @@ function isDevelopment(): boolean {
   return nodeEnv !== "production";
 }
 
-export class AiMessage extends HTMLElement {
+export class AiMessageElement extends HTMLElement {
   constructor() {
     super();
     // Empty Shadow DOM (no slot) suppresses light-DOM rendering of the message
@@ -20,7 +20,7 @@ export class AiMessage extends HTMLElement {
     this.attachShadow({ mode: "open" });
   }
 
-  get role(): string {
+  override get role(): string {
     const raw = this.getAttribute("role") || "system";
     // The role attribute is the only steering signal Ai.ts uses to bucket a
     // message into system / user / assistant; a typo (e.g. role="users") is
@@ -32,7 +32,7 @@ export class AiMessage extends HTMLElement {
         _warnedRoleTypos.add(raw);
         console.warn(
           `[@csbc-dev/ai-agent] <ai-message role="${raw}"> uses an unknown role. ` +
-          "Expected one of \"system\", \"user\", \"assistant\". The element will be ignored by <ai-agent> seeding."
+          "Expected one of \"system\", \"user\", \"assistant\", \"tool\". The element will be ignored by <ai-agent> seeding."
         );
       }
     }

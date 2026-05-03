@@ -47,8 +47,9 @@ export function validateMessages(messages: AiMessage[]): void {
     if (Array.isArray(m.content)) {
       try {
         assertKnownContentParts(m.content);
-      } catch (err: any) {
-        throw new Error(`[@csbc-dev/ai-agent] messages[${i}].content: ${err?.message ?? String(err)}`);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`[@csbc-dev/ai-agent] messages[${i}].content: ${message}`);
       }
     }
     if (m.role === "tool") {

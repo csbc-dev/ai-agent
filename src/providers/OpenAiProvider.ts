@@ -20,20 +20,37 @@ export class OpenAiProvider implements IAiProvider {
       headers["Authorization"] = `Bearer ${options.apiKey}`;
     }
 
+    const body = this._buildBody(messages, options, { includeStreamOptions: isDefaultBaseUrl });
+
+    return { url, headers, body: JSON.stringify(body) };
+  }
+
+  /**
+   * Construct the JSON request body shared by OpenAI and Azure OpenAI Chat
+   * Completions. Azure has the same body schema as OpenAI but ships `model`
+   * in the URL deployment segment instead of the body, and unconditionally
+   * accepts `stream_options` (the custom-base-url heuristic does not apply
+   * because the deployment URL is the contract). Sub-classes call this with
+   * `includeStreamOptions` set explicitly so the policy stays at the call
+   * site, not inside the helper.
+   */
+  protected _buildBody(
+    messages: AiMessage[],
+    options: AiRequestOptions,
+    { includeStreamOptions, includeModel = true }: { includeStreamOptions: boolean; includeModel?: boolean },
+  ): Record<string, any> {
     const body: Record<string, any> = {
-      model: options.model,
       messages: messages.map(m => this._serializeMessage(m)),
       stream: options.stream ?? true,
     };
+    if (includeModel) body.model = options.model;
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens;
-    // stream_options is an OpenAI-specific extension; omit it for custom base URLs
-    // (e.g. Ollama, vLLM) where it may cause 400 errors. Only emit when the
-    // caller did not override `baseUrl` — a user-supplied value, even one that
-    // happens to point at the official host, signals "I am taking control of
-    // the endpoint" and could be a transparent proxy that does not understand
-    // the option.
-    if (body.stream && isDefaultBaseUrl) {
+    // stream_options is an OpenAI-specific extension; the caller decides
+    // whether to emit it (omitted for custom OpenAI-compatible base URLs
+    // like Ollama/vLLM where it may cause 400 errors; always emitted for
+    // Azure where the deployment URL pins the endpoint contract).
+    if (body.stream && includeStreamOptions) {
       body.stream_options = { include_usage: true };
     }
     if (options.tools && options.tools.length > 0) {
@@ -59,8 +76,7 @@ export class OpenAiProvider implements IAiProvider {
         },
       };
     }
-
-    return { url, headers, body: JSON.stringify(body) };
+    return body;
   }
 
   protected _serializeMessage(m: AiMessage): Record<string, any> {

@@ -1,5 +1,5 @@
 import { Ai } from "./components/Ai.js";
-import { AiMessage } from "./components/AiMessage.js";
+import { AiMessageElement } from "./components/AiMessage.js";
 import { config } from "./config.js";
 import { raiseError } from "./raiseError.js";
 
@@ -36,5 +36,5 @@ function defineOrVerify(tag: string, ctor: CustomElementConstructor, label: stri
 
 export function registerComponents(): void {
   defineOrVerify(config.tagNames.ai, Ai, "Ai");
-  defineOrVerify(config.tagNames.aiMessage, AiMessage, "AiMessage");
+  defineOrVerify(config.tagNames.aiMessage, AiMessageElement, "AiMessageElement");
 }

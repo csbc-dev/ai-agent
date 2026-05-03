@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   warnApiKeyInRemoteMode,
+  errorApiKeyDroppedInRemoteMode,
   warnMalformedToolCall,
   warnStreamParseFailure,
 } from "../src/debug";
@@ -89,7 +90,7 @@ describe("debug", () => {
   });
 
   describe("warnApiKeyInRemoteMode", () => {
-    it("development環境ではapi-key leakを警告する", () => {
+    it("development環境ではforward-credentials有効時の意図的フォワードを警告する", () => {
       (globalThis as any).process = { env: { NODE_ENV: "development" } };
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -98,8 +99,8 @@ describe("debug", () => {
       expect(warnSpy).toHaveBeenCalledTimes(1);
       const [message] = warnSpy.mock.calls[0];
       expect(message).toContain("[@csbc-dev/ai-agent]");
-      expect(message).toContain("`api-key` attribute");
-      expect(message).toContain("remote mode");
+      expect(message).toContain("forward-credentials");
+      expect(message).toContain("WebSocket");
     });
 
     it("console.warnが使えない環境でも何もしない", () => {
@@ -115,5 +116,32 @@ describe("debug", () => {
     });
 
     // production no-op は warnMalformedToolCall 側の注記を参照。
+  });
+
+  describe("errorApiKeyDroppedInRemoteMode", () => {
+    it("api-key設定済みでforward-credentials未有効ならproduction可視のerrorを出す", () => {
+      // 明示的に production を設定しても発火することを確認 (dev gate なし)
+      (globalThis as any).process = { env: { NODE_ENV: "production" } };
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      errorApiKeyDroppedInRemoteMode();
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const [message] = errorSpy.mock.calls[0];
+      expect(message).toContain("[@csbc-dev/ai-agent]");
+      expect(message).toContain("NOT being sent");
+      expect(message).toContain("forward-credentials");
+    });
+
+    it("console.errorが使えない環境でも何もしない", () => {
+      const originalConsole = globalThis.console;
+      (globalThis as any).console = {};
+
+      expect(() => {
+        errorApiKeyDroppedInRemoteMode();
+      }).not.toThrow();
+
+      (globalThis as any).console = originalConsole;
+    });
   });
 });

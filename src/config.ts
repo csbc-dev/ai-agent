@@ -29,19 +29,25 @@ function resolveRemoteCoreUrl(cfg: IInternalConfig): string {
   return cfg.remote.remoteCoreUrl;
 }
 
-const _config: IInternalConfig = {
-  autoTrigger: true,
-  triggerAttribute: "data-aitarget",
-  tagNames: {
-    ai: "ai-agent",
-    aiMessage: "ai-message",
-  },
-  remote: {
-    enableRemote: false,
-    remoteSettingType: "config",
-    remoteCoreUrl: "",
-  },
-};
+// Defaults are kept in a factory so `resetConfig()` can produce a fresh object
+// rather than mutating shared references between test cases.
+function createDefaultConfig(): IInternalConfig {
+  return {
+    autoTrigger: true,
+    triggerAttribute: "data-aitarget",
+    tagNames: {
+      ai: "ai-agent",
+      aiMessage: "ai-message",
+    },
+    remote: {
+      enableRemote: false,
+      remoteSettingType: "config",
+      remoteCoreUrl: "",
+    },
+  };
+}
+
+const _config: IInternalConfig = createDefaultConfig();
 
 function deepFreeze<T>(obj: T): T {
   if (obj === null || typeof obj !== "object") return obj;
@@ -146,4 +152,23 @@ export function setConfig(partialConfig: IWritableConfig): void {
 
 export function getRemoteCoreUrl(): string {
   return resolveRemoteCoreUrl(_config);
+}
+
+/**
+ * Reset module-level config back to its initial defaults. Intended for tests
+ * that mutate config via `setConfig()` and need a clean slate without
+ * spelling out every field in an `afterEach` block. Not part of the
+ * production public API surface, but exported so test code outside this
+ * package (consumer integration tests) can use it too.
+ */
+export function resetConfig(): void {
+  const defaults = createDefaultConfig();
+  _config.autoTrigger = defaults.autoTrigger;
+  _config.triggerAttribute = defaults.triggerAttribute;
+  _config.tagNames.ai = defaults.tagNames.ai;
+  _config.tagNames.aiMessage = defaults.tagNames.aiMessage;
+  _config.remote.enableRemote = defaults.remote.enableRemote;
+  _config.remote.remoteSettingType = defaults.remote.remoteSettingType;
+  _config.remote.remoteCoreUrl = defaults.remote.remoteCoreUrl;
+  frozenConfig = null;
 }

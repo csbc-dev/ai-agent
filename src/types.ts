@@ -254,7 +254,7 @@ export interface AiHttpError {
   retryAfter?: number;
 }
 
-export interface WcsAiCoreValues {
+export interface AiAgentCoreValues {
   content: string;
   messages: AiMessage[];
   usage: AiUsage | null;
@@ -263,6 +263,12 @@ export interface WcsAiCoreValues {
   error: AiHttpError | Error | null;
 }
 
-export interface WcsAiValues extends WcsAiCoreValues {
+export interface AiAgentValues extends AiAgentCoreValues {
   trigger: boolean;
 }
+
+/** @deprecated since 0.5 — use `AiAgentCoreValues`. Removed in 0.6. */
+export type WcsAiCoreValues = AiAgentCoreValues;
+
+/** @deprecated since 0.5 — use `AiAgentValues`. Removed in 0.6. */
+export type WcsAiValues = AiAgentValues;

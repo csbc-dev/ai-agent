@@ -1,12 +1,13 @@
 import { config, getRemoteCoreUrl } from "../config.js";
-import { warnApiKeyInRemoteMode } from "../debug.js";
+import { warnApiKeyInRemoteMode, errorApiKeyDroppedInRemoteMode } from "../debug.js";
 import type {
   IWcBindable, AiMessage, AiHttpError, AiContentPart, AiTool, AiToolChoice,
 } from "../types.js";
 import { AiCore } from "../core/AiCore.js";
 import { cloneMessage } from "../core/cloneMessage.js";
 import { validateMessages } from "../core/validateMessages.js";
-import { AiMessage as AiMessageElement } from "./AiMessage.js";
+import { narrowError } from "../narrowError.js";
+import { AiMessageElement } from "./AiMessage.js";
 import { registerAutoTrigger, unregisterAutoTrigger } from "../autoTrigger.js";
 import {
   createRemoteCoreProxy,
@@ -35,6 +36,7 @@ export class Ai extends HTMLElement {
   private _ws: WebSocket | null = null;
   private _trigger: boolean = false;
   private _warnedApiKeyLeak: boolean = false;
+  private _warnedApiKeyDropped: boolean = false;
   private _prompt: string | AiContentPart[] = "";
   private _tools: AiTool[] | null = null;
   private _toolChoice: AiToolChoice | undefined = undefined;
@@ -102,18 +104,7 @@ export class Ai extends HTMLElement {
   }
 
   private _setErrorState(error: unknown): void {
-    // Narrow to the public contract (AiHttpError | Error | null). Wrap
-    // anything else in an Error so el.error typing stays honest.
-    let narrowed: AiHttpError | Error | null;
-    if (error === null || error === undefined) {
-      narrowed = null;
-    } else if (error instanceof Error) {
-      narrowed = error;
-    } else if (typeof error === "object" && error !== null && "status" in error) {
-      narrowed = error as AiHttpError;
-    } else {
-      narrowed = new Error(String(error));
-    }
+    const narrowed = narrowError(error);
     this._errorState = narrowed;
     this._hasLocalError = true;
     this.dispatchEvent(new CustomEvent("ai-agent:error", {
@@ -171,7 +162,7 @@ export class Ai extends HTMLElement {
   }
 
   /** @internal — visible for testing */
-  _connectRemote(transport: ClientTransport): void {
+  private _connectRemote(transport: ClientTransport): void {
     this._proxy = createRemoteCoreProxy(AiCore.wcBindable, transport);
 
     // Bridge proxy events to this HTMLElement so framework adapters work
@@ -186,6 +177,26 @@ export class Ai extends HTMLElement {
         if (!this._lastProviderError) {
           this._errorState = null;
           this._hasLocalError = false;
+        }
+      }
+      // Sanitize server-synced messages before storing: a compromised /
+      // misconfigured server should not be able to inject a malformed
+      // history shape that the client then exposes through `el.messages`.
+      // validateMessages enforces the structural contract; cloneMessage
+      // breaks aliasing with the proxy's internal buffer so later in-place
+      // mutation by the proxy cannot reach into _remoteValues.
+      if (name === "messages") {
+        try {
+          if (Array.isArray(value)) {
+            validateMessages(value as AiMessage[]);
+            value = (value as AiMessage[]).map(cloneMessage);
+          }
+        } catch (e) {
+          // Surface the validation failure through the error channel and
+          // drop the malformed sync so a downstream `get messages()` does
+          // not return a structurally invalid array.
+          this._setErrorState(e);
+          return;
         }
       }
       this._remoteValues[name] = value;
@@ -269,6 +280,30 @@ export class Ai extends HTMLElement {
     this.setAttribute("api-version", value);
   }
 
+  /**
+   * In remote mode, controls whether the client-side `apiKey` / `baseUrl` /
+   * `apiVersion` attributes are sent to the server in the `send()` payload.
+   *
+   * Default: `false` — credentials stay on the client and are not transmitted.
+   * The server is expected to hold provider credentials (the canonical
+   * Case B1 deployment shape).
+   *
+   * Set to `true` only when the server is a trusted transparent proxy that
+   * needs the per-request key (e.g. a multi-tenant gateway that rotates keys
+   * per user). Local mode ignores this flag entirely.
+   */
+  get forwardCredentials(): boolean {
+    return this.hasAttribute("forward-credentials") && this.getAttribute("forward-credentials") !== "false";
+  }
+
+  set forwardCredentials(value: boolean) {
+    if (value) {
+      this.setAttribute("forward-credentials", "true");
+    } else {
+      this.removeAttribute("forward-credentials");
+    }
+  }
+
   // --- JS-only properties ---
 
   get prompt(): string | AiContentPart[] { return this._prompt; }
@@ -291,7 +326,13 @@ export class Ai extends HTMLElement {
 
   get temperature(): number | undefined {
     const v = this.getAttribute("temperature");
-    return v !== null ? Number(v) : undefined;
+    // Guard against `Number("")` → 0 and `Number("non-numeric")` → NaN
+    // both silently shipping a bogus value to the provider. `undefined`
+    // here makes AiCore's validation skip the temperature field, which
+    // matches the "attribute absent" intent better than 0/NaN ever could.
+    if (v === null || v === "") return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
   }
 
   set temperature(value: number | undefined) {
@@ -304,7 +345,13 @@ export class Ai extends HTMLElement {
 
   get maxTokens(): number | undefined {
     const v = this.getAttribute("max-tokens");
-    return v !== null ? Number(v) : undefined;
+    // Same guard as `temperature`: `Number("")` is 0 and `Number("abc")`
+    // is NaN, both of which would fail AiCore's positive-integer check
+    // anyway but with a confusing error pointing at the user-supplied
+    // raw value rather than the absent-attribute intent.
+    if (v === null || v === "") return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
   }
 
   set maxTokens(value: number | undefined) {
@@ -455,6 +502,11 @@ export class Ai extends HTMLElement {
   async send(): Promise<string | null> {
     // Wait for any in-flight provider update so we gate on the latest result,
     // not a stale error from a previously superseded attempt.
+    //
+    // The ack.then(...) handlers in _applyProvider are registered before this
+    // await runs, so per the Promise spec their continuations execute first
+    // when ack settles — _lastProviderError is therefore guaranteed to reflect
+    // ack's outcome by the time control returns here.
     if (this._providerUpdate) {
       try { await this._providerUpdate; } catch { /* error captured via _lastProviderError */ }
     }
@@ -469,16 +521,24 @@ export class Ai extends HTMLElement {
         // JSON-encodable. The server resolves handlers by name from the
         // `registerTool()` registry at invocation time.
         const remoteTools = this._tools?.map(({ handler: _handler, ...rest }) => rest);
-        // In remote mode the server owns provider credentials. Surface a
-        // one-time dev warning when the client-side `api-key` attribute is
-        // still populated so authors don't silently ship the secret over
-        // the wire. The attribute is still included in the payload (so a
-        // remote deployment that intentionally relays per-request keys to
-        // a trusted proxy is not broken), but the warning flags the usual
-        // misuse: a forgotten dev-time attribute on a production element.
-        if (!this._warnedApiKeyLeak && this.apiKey) {
-          this._warnedApiKeyLeak = true;
-          warnApiKeyInRemoteMode();
+        // Credential gating in remote mode:
+        //   - Default (forwardCredentials=false): apiKey/baseUrl/apiVersion are
+        //     dropped from the payload. The server is the source of truth for
+        //     provider credentials (Case B1). If apiKey is set on the element
+        //     in this state, fire a one-time production-visible error so a 0.4→0.5
+        //     upgrader sees that their key is no longer being sent.
+        //   - Opt-in (forwardCredentials=true): credentials are forwarded as
+        //     before, with a dev-only nudge that this is only for trusted
+        //     transparent-proxy deployments.
+        const forward = this.forwardCredentials;
+        if (forward) {
+          if (!this._warnedApiKeyLeak && this.apiKey) {
+            this._warnedApiKeyLeak = true;
+            warnApiKeyInRemoteMode();
+          }
+        } else if (!this._warnedApiKeyDropped && this.apiKey) {
+          this._warnedApiKeyDropped = true;
+          errorApiKeyDroppedInRemoteMode();
         }
         // Use invokeWithOptions with timeoutMs: 0 to disable the default 30s
         // timeout — AI inference and long streaming responses routinely exceed it.
@@ -488,9 +548,11 @@ export class Ai extends HTMLElement {
           temperature: this.temperature,
           maxTokens: this.maxTokens,
           system: this._collectSystem(),
-          apiKey: this.apiKey,
-          baseUrl: this.baseUrl,
-          apiVersion: this.apiVersion,
+          ...(forward ? {
+            apiKey: this.apiKey,
+            baseUrl: this.baseUrl,
+            apiVersion: this.apiVersion,
+          } : {}),
           tools: remoteTools,
           toolChoice: this._toolChoice,
           maxToolRoundtrips: this._maxToolRoundtrips,

@@ -11,6 +11,7 @@ import { AnthropicProvider } from "../providers/AnthropicProvider.js";
 import { AzureOpenAiProvider } from "../providers/AzureOpenAiProvider.js";
 import { GoogleProvider } from "../providers/GoogleProvider.js";
 import { getRegisteredTool, AiToolHandler } from "../toolRegistry.js";
+import { narrowError } from "../narrowError.js";
 import { cloneMessage } from "./cloneMessage.js";
 import { validateMessages } from "./validateMessages.js";
 
@@ -202,6 +203,14 @@ export class AiCore extends EventTarget {
   }
 
   private _emitMessages(): void {
+    // `this.messages` deep-clones every entry on each access. Combined with
+    // per-turn calls during the tool-use loop this is O(N×M) where N = history
+    // length and M = number of emissions per send(). For typical conversations
+    // (≤ ~hundreds of messages, single-digit roundtrips) the cost is
+    // negligible; long histories with many tool roundtrips will pay it
+    // visibly. A future optimization could share an immutable snapshot
+    // across listeners, but the public contract requires that the detail
+    // be safe for external mutation.
     this._target.dispatchEvent(new CustomEvent("ai-agent:messages-changed", {
       detail: this.messages,
       bubbles: true,
@@ -233,23 +242,18 @@ export class AiCore extends EventTarget {
   }
 
   private _setError(error: unknown): void {
-    // Wrap Error instances rather than mutating them so the caller's Error
-    // keeps its original shape when the same instance is referenced or
-    // JSON.stringified elsewhere. HTTP error shapes (plain objects produced
-    // internally by _fetchTurn) are stored as-is.
+    // Narrow first via the shared helper so Core/Shell agree on the public
+    // `AiHttpError | Error | null` contract, then layer Core's own concern
+    // on top: `Error` instances are wrapped in `AiSerializableError` so
+    // `JSON.stringify` preserves name/message/stack across remote transport.
+    const narrowed = narrowError(error);
     let stored: AiCoreError;
-    if (error === null || error === undefined) {
-      stored = null;
-    } else if (error instanceof AiSerializableError) {
-      stored = error;
-    } else if (error instanceof Error) {
-      stored = new AiSerializableError(error);
-    } else if (typeof error === "object" && error !== null && "status" in error) {
-      stored = error as AiHttpError;
+    if (narrowed instanceof AiSerializableError) {
+      stored = narrowed;
+    } else if (narrowed instanceof Error) {
+      stored = new AiSerializableError(narrowed);
     } else {
-      // Non-Error, non-AiHttpError values are wrapped into an Error so the
-      // public `error: AiHttpError | Error | null` contract holds.
-      stored = new AiSerializableError(new Error(String(error)));
+      stored = narrowed; // null or AiHttpError
     }
     this._error = stored;
     this._target.dispatchEvent(new CustomEvent("ai-agent:error", {
@@ -260,21 +264,42 @@ export class AiCore extends EventTarget {
 
   // --- rAF batching ---
 
+  // Track whether the last scheduled flush used setTimeout (visibility fallback)
+  // or requestAnimationFrame, so _cancelFlush calls the matching cancel API.
+  // rAF / setTimeout ids are not interchangeable across cancel functions.
+  private _flushUsedTimeout: boolean = false;
+
   private _scheduleFlush(): void {
     if (this._flushScheduled) return;
     this._flushScheduled = true;
-    const raf = globalThis.requestAnimationFrame ?? ((cb: FrameRequestCallback) => setTimeout(cb, 16));
-    this._rafId = raf(() => {
+    // Browsers throttle requestAnimationFrame to ~1Hz (or stop it entirely)
+    // when the tab is in the background, which would freeze streaming
+    // content updates. Fall back to setTimeout when document.hidden so a
+    // background tab still gets ~60ms-cadence updates instead of pausing.
+    // Non-browser runtimes (no document, no rAF) also land on setTimeout.
+    const useTimeout = typeof globalThis.requestAnimationFrame !== "function" ||
+      (typeof document !== "undefined" && document.hidden === true);
+    this._flushUsedTimeout = useTimeout;
+    const cb = () => {
       this._flushScheduled = false;
       this._rafId = null;
       this._setContent(this._content);
-    });
+    };
+    this._rafId = useTimeout
+      ? setTimeout(cb, 16)
+      : globalThis.requestAnimationFrame(cb);
   }
 
   private _cancelFlush(): void {
     if (this._rafId !== null) {
-      const cancel = globalThis.cancelAnimationFrame ?? clearTimeout;
-      cancel(this._rafId as any);
+      if (this._flushUsedTimeout) {
+        clearTimeout(this._rafId as ReturnType<typeof setTimeout>);
+      } else {
+        // cancelAnimationFrame is paired with the rAF that produced this id;
+        // the fallback to clearTimeout would be wrong here (different id space).
+        const cancel = globalThis.cancelAnimationFrame;
+        if (typeof cancel === "function") cancel(this._rafId as number);
+      }
       this._rafId = null;
       this._flushScheduled = false;
     }
@@ -506,8 +531,8 @@ export class AiCore extends EventTarget {
               bubbles: true,
             }));
             return { toolCallId: call.id, content };
-          } catch (err: any) {
-            const message = err?.message ?? String(err);
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
             this._target.dispatchEvent(new CustomEvent("ai-agent:tool-call-completed", {
               detail: { toolCall: { ...call }, error: message },
               bubbles: true,
@@ -530,8 +555,8 @@ export class AiCore extends EventTarget {
         }
         // Loop continues: next turn will include these tool messages in history.
       }
-    } catch (e: any) {
-      if (e?.name === "AbortError") {
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === "AbortError") {
         rollback();
         if (isCurrent()) {
           this._setStreaming(false);

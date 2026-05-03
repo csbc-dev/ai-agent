@@ -667,6 +667,101 @@ describe("AiCore", () => {
       vi.useRealTimers();
     });
 
+    it("document.hidden=true ならbackgroundタブ用にsetTimeoutフォールバックでflushする", async () => {
+      const core = new AiCore();
+      const coreAny = core as any;
+      const contents: string[] = [];
+      const rafSpy = vi.fn().mockReturnValue(99);
+      const originalRaf = globalThis.requestAnimationFrame;
+      const originalCancel = globalThis.cancelAnimationFrame;
+      const originalHidden = Object.getOwnPropertyDescriptor(Document.prototype, "hidden");
+
+      vi.useFakeTimers();
+      globalThis.requestAnimationFrame = rafSpy as any;
+      globalThis.cancelAnimationFrame = vi.fn() as any;
+      // happy-dom defaults document.hidden to false; spoof hidden=true.
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+
+      core.addEventListener("ai-agent:content-changed", (e: Event) => {
+        contents.push((e as CustomEvent).detail);
+      });
+
+      coreAny._content = "buffered-bg";
+      coreAny._scheduleFlush();
+
+      // background fallback should NOT call rAF
+      expect(rafSpy).not.toHaveBeenCalled();
+      expect(coreAny._flushScheduled).toBe(true);
+      expect(coreAny._flushUsedTimeout).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(16);
+
+      expect(contents).toEqual(["buffered-bg"]);
+      expect(coreAny._flushScheduled).toBe(false);
+      expect(coreAny._rafId).toBeNull();
+
+      globalThis.requestAnimationFrame = originalRaf;
+      globalThis.cancelAnimationFrame = originalCancel;
+      if (originalHidden) Object.defineProperty(document, "hidden", originalHidden);
+      else delete (document as any).hidden;
+      vi.useRealTimers();
+    });
+
+    it("setTimeoutで予約したflushはclearTimeoutでキャンセルされる (cancelAnimationFrameは呼ばない)", async () => {
+      const core = new AiCore();
+      const coreAny = core as any;
+      const cancelRafSpy = vi.fn();
+      const originalRaf = globalThis.requestAnimationFrame;
+      const originalCancel = globalThis.cancelAnimationFrame;
+      const originalHidden = Object.getOwnPropertyDescriptor(Document.prototype, "hidden");
+
+      vi.useFakeTimers();
+      // rAF available, but document.hidden=true forces setTimeout path.
+      globalThis.requestAnimationFrame = vi.fn().mockReturnValue(42) as any;
+      globalThis.cancelAnimationFrame = cancelRafSpy as any;
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+
+      coreAny._content = "x";
+      coreAny._scheduleFlush();
+      expect(coreAny._flushUsedTimeout).toBe(true);
+
+      coreAny._cancelFlush();
+      expect(cancelRafSpy).not.toHaveBeenCalled(); // setTimeout id を rAF cancel に渡してはならない
+
+      // 何も発火しない
+      const contents: string[] = [];
+      core.addEventListener("ai-agent:content-changed", (e: Event) => {
+        contents.push((e as CustomEvent).detail);
+      });
+      await vi.advanceTimersByTimeAsync(16);
+      expect(contents).toEqual([]);
+
+      globalThis.requestAnimationFrame = originalRaf;
+      globalThis.cancelAnimationFrame = originalCancel;
+      if (originalHidden) Object.defineProperty(document, "hidden", originalHidden);
+      else delete (document as any).hidden;
+      vi.useRealTimers();
+    });
+
+    it("document.hidden=falseならrAFパスを使う (フォールバックなし)", () => {
+      const core = new AiCore();
+      const coreAny = core as any;
+      const rafSpy = vi.fn().mockReturnValue(7);
+      const originalRaf = globalThis.requestAnimationFrame;
+      const originalHidden = Object.getOwnPropertyDescriptor(Document.prototype, "hidden");
+
+      globalThis.requestAnimationFrame = rafSpy as any;
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+
+      coreAny._scheduleFlush();
+      expect(rafSpy).toHaveBeenCalledTimes(1);
+      expect(coreAny._flushUsedTimeout).toBe(false);
+
+      globalThis.requestAnimationFrame = originalRaf;
+      if (originalHidden) Object.defineProperty(document, "hidden", originalHidden);
+      else delete (document as any).hidden;
+    });
+
     it("古いストリームはflushせずに早期終了する", async () => {
       const core = new AiCore();
       const coreAny = core as any;

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Ai } from "../src/components/Ai";
-import { AiMessage } from "../src/components/AiMessage";
+import { AiMessageElement } from "../src/components/AiMessage";
 import { registerComponents } from "../src/registerComponents";
 import { bootstrapAi } from "../src/bootstrapAi";
 import { config, setConfig, getConfig, getRemoteCoreUrl } from "../src/config";
@@ -530,7 +530,7 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("provider", "openai");
       el.setAttribute("model", "gpt-4o");
       el.stream = false;
-      const msgEl = document.createElement("ai-message") as AiMessage;
+      const msgEl = document.createElement("ai-message") as AiMessageElement;
       msgEl.setAttribute("role", "system");
       msgEl.textContent = "You are a helpful assistant.";
       el.appendChild(msgEl);
@@ -553,7 +553,7 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("model", "gpt-4o");
       el.setAttribute("system", "Priority system");
       el.stream = false;
-      const msgEl = document.createElement("ai-message") as AiMessage;
+      const msgEl = document.createElement("ai-message") as AiMessageElement;
       msgEl.setAttribute("role", "system");
       msgEl.textContent = "Fallback system";
       el.appendChild(msgEl);
@@ -576,12 +576,12 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("model", "gpt-4o");
       el.stream = false;
 
-      const userMsg = document.createElement("ai-message") as AiMessage;
+      const userMsg = document.createElement("ai-message") as AiMessageElement;
       userMsg.setAttribute("role", "user");
       userMsg.textContent = "Initial user message";
       el.appendChild(userMsg);
 
-      const sysMsg = document.createElement("ai-message") as AiMessage;
+      const sysMsg = document.createElement("ai-message") as AiMessageElement;
       sysMsg.setAttribute("role", "system");
       sysMsg.textContent = "System prompt";
       el.appendChild(sysMsg);
@@ -605,12 +605,12 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("model", "gpt-4o");
       el.stream = false;
 
-      const u1 = document.createElement("ai-message") as AiMessage;
+      const u1 = document.createElement("ai-message") as AiMessageElement;
       u1.setAttribute("role", "user");
       u1.textContent = "What is 2+2?";
       el.appendChild(u1);
 
-      const a1 = document.createElement("ai-message") as AiMessage;
+      const a1 = document.createElement("ai-message") as AiMessageElement;
       a1.setAttribute("role", "assistant");
       a1.textContent = "4.";
       el.appendChild(a1);
@@ -646,12 +646,12 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("model", "gpt-4o");
       el.stream = false;
 
-      const sys = document.createElement("ai-message") as AiMessage;
+      const sys = document.createElement("ai-message") as AiMessageElement;
       sys.setAttribute("role", "system");
       sys.textContent = "Be terse.";
       el.appendChild(sys);
 
-      const u = document.createElement("ai-message") as AiMessage;
+      const u = document.createElement("ai-message") as AiMessageElement;
       u.setAttribute("role", "user");
       u.textContent = "Hi";
       el.appendChild(u);
@@ -680,7 +680,7 @@ describe("Ai (ai-agent)", () => {
       el.messages = [{ role: "user", content: "programmatic" }];
 
       // 後からDOMにfew-shot子要素を追加
-      const u = document.createElement("ai-message") as AiMessage;
+      const u = document.createElement("ai-message") as AiMessageElement;
       u.setAttribute("role", "user");
       u.textContent = "from-dom";
       el.appendChild(u);
@@ -697,12 +697,12 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("provider", "openai");
       el.setAttribute("model", "gpt-4o");
 
-      const empty = document.createElement("ai-message") as AiMessage;
+      const empty = document.createElement("ai-message") as AiMessageElement;
       empty.setAttribute("role", "user");
       empty.textContent = "   "; // whitespace only
       el.appendChild(empty);
 
-      const real = document.createElement("ai-message") as AiMessage;
+      const real = document.createElement("ai-message") as AiMessageElement;
       real.setAttribute("role", "user");
       real.textContent = "real content";
       el.appendChild(real);
@@ -723,7 +723,7 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("model", "gpt-4o");
       el.stream = false;
 
-      const msgEl = document.createElement("ai-message") as AiMessage;
+      const msgEl = document.createElement("ai-message") as AiMessageElement;
       // role属性を設定しない（デフォルトsystem）
       msgEl.textContent = "Default system";
       el.appendChild(msgEl);
@@ -1087,23 +1087,23 @@ describe("Ai (ai-agent)", () => {
 
 describe("AiMessage (ai-message)", () => {
   it("role属性のデフォルトはsystem", () => {
-    const el = document.createElement("ai-message") as AiMessage;
+    const el = document.createElement("ai-message") as AiMessageElement;
     expect(el.role).toBe("system");
   });
 
   it("messageContentでテキストを取得できる", () => {
-    const el = document.createElement("ai-message") as AiMessage;
+    const el = document.createElement("ai-message") as AiMessageElement;
     el.textContent = "  You are helpful.  ";
     expect(el.messageContent).toBe("You are helpful.");
   });
 
   it("textContentが空の場合は空文字を返す", () => {
-    const el = document.createElement("ai-message") as AiMessage;
+    const el = document.createElement("ai-message") as AiMessageElement;
     expect(el.messageContent).toBe("");
   });
 
   it("Shadow DOMでlight DOMの描画を抑制する", () => {
-    const el = document.createElement("ai-message") as AiMessage;
+    const el = document.createElement("ai-message") as AiMessageElement;
     expect(el.shadowRoot).not.toBeNull();
   });
 });

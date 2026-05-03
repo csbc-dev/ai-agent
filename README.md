@@ -953,6 +953,21 @@ Or load the environment-resolving auto entrypoint (see below) and skip `bootstra
 import "@csbc-dev/ai-agent/auto/remoteEnv";
 ```
 
+### Configuration order constraint
+
+`<ai-agent>` reads `config.remote.enableRemote` once, in its constructor, to decide whether to instantiate a local `AiCore` or open the remote proxy. As a consequence:
+
+- Call `bootstrapAi({ remote: { enableRemote: true, ... } })` **before any `<ai-agent>` element is constructed**. Constructing happens at custom-element upgrade time — i.e. as soon as the tag is parsed in the DOM or `document.createElement("ai-agent")` is called *after* `customElements.define("ai-agent", Ai)` (which `bootstrapAi` performs).
+- Switching `enableRemote` after elements already exist will not migrate them. The safest order is `bootstrapAi(...)` → first DOM mount.
+- HMR / repeated `bootstrapAi` calls that flip `enableRemote` mid-session can leave previously-upgraded elements in the old mode while new elements come up in the new mode. Reload the page (or recreate the elements) when toggling mode in development.
+
+### Pre-attach state in remote mode
+
+In **local mode**, the Core is created in the constructor, so setting `el.messages = [...]` or `el.prompt = "..."` before appending the element to the DOM works (the Core stores them). In **remote mode**, the proxy is opened in `connectedCallback`, so:
+
+- Setting `el.messages = [...]` before the element is connected is a no-op (the proxy does not exist to receive the write).
+- Append the element to the DOM first, wait for the initial sync (`ai-agent:messages-changed` fires), then set imperative state. Or use the declarative DOM form (`<ai-message role="user">…</ai-message>` children) for an initial prompt — note that those are not seeded in remote mode either; the server owns conversation state.
+
 ### `remoteSettingType`
 
 | Value | Resolution order for `remoteCoreUrl` |
@@ -977,6 +992,43 @@ Setting `enableRemote: true` with an empty URL does not throw out of `appendChil
 |------------|----------|
 | `@csbc-dev/ai-agent/auto` | Registers the custom elements with default (local) config. |
 | `@csbc-dev/ai-agent/auto/remoteEnv` | Registers the custom elements and enables remote mode with `remoteSettingType: "env"`. `AI_REMOTE_CORE_URL` is resolved when a `<ai-agent>` element initializes its remote connection. |
+
+### Credential forwarding (`forward-credentials`)
+
+In remote mode, `<ai-agent>` does **not** transmit `api-key` / `base-url` / `api-version` to the server by default. The server is the source of truth for provider credentials (the canonical Case B1 deployment shape), so anything the client puts in those attributes is silently dropped from the wire payload.
+
+```html
+<!-- Default: api-key is dropped, never sent to the server. -->
+<ai-agent provider="openai" api-key="this-stays-local"></ai-agent>
+```
+
+If your server is a trusted transparent proxy that needs the per-request key (multi-tenant gateway, BYO-key model, …), opt in with `forward-credentials="true"`:
+
+```html
+<!-- Opt-in: api-key is sent over the WebSocket. -->
+<ai-agent provider="openai"
+          api-key="sk-..."
+          base-url="wss://gateway.example/proxy"
+          forward-credentials="true"></ai-agent>
+```
+
+Behavior summary:
+
+| `api-key` set? | `forward-credentials` | Wire payload | Console |
+|---|---|---|---|
+| no | — | no creds | silent |
+| yes | `false` (default) | no creds | one-time `console.error` per element (production-visible — set `forward-credentials="true"` if you actually want forwarding) |
+| yes | `true` | `apiKey` / `baseUrl` / `apiVersion` included | one-time dev-mode `console.warn` (acknowledgement that you're forwarding a secret) |
+
+> **Migration from 0.4.x:** previously, remote mode forwarded credentials by default. The 0.5 default is now "do not forward." If you relied on the old behavior (server-as-transparent-proxy), add `forward-credentials="true"` explicitly. The production `console.error` is intentionally loud so the regression surfaces immediately during upgrade.
+
+`forwardCredentials` is also exposed as a JS property:
+
+```js
+document.querySelector("ai-agent").forwardCredentials = true;
+```
+
+Local mode ignores this flag entirely (the Core uses the credentials directly without crossing a network).
 
 ### Server setup
 

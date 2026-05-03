@@ -5,6 +5,19 @@ function cloneContent(content: AiContent): AiContent {
   return content.map(part => ({ ...part }));
 }
 
+function isDevelopment(): boolean {
+  // Mirrors src/debug.ts to avoid a cross-import for a single dev-mode
+  // warning. cloneMessage is on every history-read path, so keeping it
+  // standalone matters for the dependency graph.
+  const env = (import.meta as ImportMeta & { env?: { DEV?: boolean; PROD?: boolean } }).env;
+  if (typeof env?.DEV === "boolean") return env.DEV;
+  if (typeof env?.PROD === "boolean") return !env.PROD;
+  const nodeEnv = (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
+  return nodeEnv !== "production";
+}
+
+let _warnedShallowProviderHints = false;
+
 /**
  * Deep-enough copy of AiMessage so external callers cannot mutate the array
  * fields (`content` when it is a parts array, `toolCalls`) and silently alter
@@ -19,7 +32,21 @@ function cloneProviderHints(hints: Record<string, any>): Record<string, any> {
   // rather than throwing on an exotic payload.
   try {
     return JSON.parse(JSON.stringify(hints));
-  } catch {
+  } catch (error) {
+    if (
+      isDevelopment() &&
+      !_warnedShallowProviderHints &&
+      typeof console !== "undefined" &&
+      typeof console.warn === "function"
+    ) {
+      _warnedShallowProviderHints = true;
+      console.warn(
+        "[@csbc-dev/ai-agent] providerHints contains a non-JSON-serializable value " +
+        "(function, BigInt, circular reference, etc.); falling back to a shallow clone. " +
+        "External mutation of nested hint fields can now reach the Core's stored history.",
+        error,
+      );
+    }
     return { ...hints };
   }
 }

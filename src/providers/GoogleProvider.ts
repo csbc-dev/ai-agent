@@ -12,9 +12,16 @@ import { flattenContentToText, parseDataUrl } from "./contentHelpers.js";
 const GEMINI_ID_PREFIX = "gemini:";
 
 export class GoogleProvider implements IAiProvider {
-  // Monotonic counter for generating unique synthetic tool-call ids and stream
-  // accumulator indices. Instance-scoped; never decreases so collisions are
-  // impossible across turns even though AiCore's accumulator resets per-turn.
+  // Monotonic counter for synthetic tool-call ids AND stream accumulator
+  // indices. Instance-scoped and never reset, so a single GoogleProvider
+  // reused across many turns will see the index advance unboundedly. This
+  // is intentional: AiCore's per-turn accumulator is a Map keyed by index,
+  // and `Array.from(map.keys()).sort((a, b) => a - b)` preserves ordering
+  // regardless of the absolute value, so a "large" starting index is
+  // benign. The counter also feeds `_generateId`, which increments it
+  // again — id and index for the same call therefore differ by 1, but
+  // both are unique within and across turns, which is the only invariant
+  // AiCore relies on.
   private _toolCallCounter = 0;
 
   buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {

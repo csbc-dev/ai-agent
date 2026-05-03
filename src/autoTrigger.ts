@@ -15,6 +15,16 @@ function handleClick(event: Event): void {
   const aiElement = document.getElementById(aiId);
   if (!aiElement || aiElement.tagName.toLowerCase() !== config.tagNames.ai) return;
 
+  // Custom-element upgrade is asynchronous: a click that fires before the
+  // <ai-agent> definition is registered (or before the upgrade reaches a
+  // particular instance) lands on a plain HTMLElement that does not yet
+  // expose `send()`. Calling it would throw a TypeError that escapes
+  // through the click handler. Skip silently — there is no useful error
+  // channel to surface this through (the element has not finished becoming
+  // an Ai instance, so `ai-agent:error` would be no different from any
+  // other event on a vanilla element).
+  if (typeof (aiElement as any).send !== "function") return;
+
   // Route early-failure rejections (e.g. AiCore's synchronous prompt/model
   // validation, "_core not initialized" throws) through the element's error
   // channel so consumers can observe them via `ai-agent:error`. Without this,

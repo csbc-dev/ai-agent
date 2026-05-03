@@ -75,7 +75,11 @@ export function startServer(port: number): Promise<{
   port: number;
 }> {
   return new Promise((resolve) => {
-    const repoRoot = path.resolve(import.meta.dirname, "../../../../");
+    // Repo root is two levels up from `tests/integration/`. The previous
+    // `../../../../` value was a leftover from the original wc-bindable
+    // monorepo layout (where this file lived under `packages/ai/tests/...`)
+    // and pointed outside the repository in this single-package repackage.
+    const repoRoot = path.resolve(import.meta.dirname, "../../");
     const integrationDir = import.meta.dirname;
 
     const server = http.createServer((req, res) => {
@@ -130,10 +134,25 @@ export function startServer(port: number): Promise<{
         return;
       }
 
-      // Route: /packages/... (serve built dist files)
+      // Route: /packages/{core,remote}/dist/... → node_modules/@wc-bindable/{core,remote}/dist/...
+      // Route: /packages/ai/dist/... → repoRoot/dist/...
+      // The /packages/ URL space is a leftover of the original wc-bindable
+      // monorepo layout used by client.html's import map. In this single-
+      // package repackage, sibling packages live under node_modules and the
+      // ai package's own dist is at the repo root, so we translate at the
+      // server boundary rather than rewriting the import map.
       if (url.startsWith("/packages/")) {
-        const file = path.join(repoRoot, url);
-        if (fs.existsSync(file)) {
+        let file: string | null = null;
+        const aiMatch = url.match(/^\/packages\/ai\/dist\/(.*)$/);
+        const wcMatch = url.match(/^\/packages\/(core|remote)\/dist\/(.*)$/);
+        if (aiMatch) {
+          file = path.join(repoRoot, "dist", aiMatch[1]);
+        } else if (wcMatch) {
+          file = path.join(repoRoot, "node_modules", "@wc-bindable", wcMatch[1], "dist", wcMatch[2]);
+        } else {
+          file = path.join(repoRoot, url);
+        }
+        if (file && fs.existsSync(file)) {
           const ext = path.extname(file);
           res.writeHead(200, { "Content-Type": MIME[ext] ?? "application/octet-stream" });
           fs.createReadStream(file).pipe(res);

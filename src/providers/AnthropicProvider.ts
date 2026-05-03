@@ -1,4 +1,4 @@
-import { warnStreamParseFailure, warnToolArgumentsParseFailure } from "../debug.js";
+import { warnStreamParseFailure, warnToolArgumentsParseFailure, warnAnthropicDefaultMaxTokens } from "../debug.js";
 import {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiProviderRequest,
   AiStreamChunkResult, AiToolCall, AiContent, AiFinishReason,
@@ -12,6 +12,8 @@ import { flattenContentToText, parseDataUrl } from "./contentHelpers.js";
 // into a JSON string content by parseResponse, so callers see structured
 // output the same way as with OpenAI/Google.
 const STRUCTURED_OUTPUT_TOOL = "__wc_bindable_structured_response__";
+
+const DEFAULT_MAX_TOKENS = 4096;
 
 export class AnthropicProvider implements IAiProvider {
   buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {
@@ -30,11 +32,14 @@ export class AnthropicProvider implements IAiProvider {
     const systemMessages = messages.filter(m => m.role === "system");
     const nonSystemMessages = messages.filter(m => m.role !== "system");
 
+    if (options.maxTokens === undefined) {
+      warnAnthropicDefaultMaxTokens(DEFAULT_MAX_TOKENS);
+    }
     const body: Record<string, any> = {
       model: options.model,
       messages: nonSystemMessages.map(m => this._serializeMessage(m)),
       // Anthropic API requires max_tokens; fall back to a sane default when omitted.
-      max_tokens: options.maxTokens ?? 4096,
+      max_tokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
       stream: options.stream ?? true,
     };
     if (systemMessages.length > 0) {

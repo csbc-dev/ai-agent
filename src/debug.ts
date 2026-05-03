@@ -58,17 +58,35 @@ export function warnMalformedToolCall(
 // the server is expected to hold provider credentials; forwarding the
 // client-side `api-key` attribute (and its siblings `base-url` / `api-version`)
 // over the WebSocket leaks the secret to logs, proxies, and any other observer
-// on the transport. This usually happens because an author switched the
-// component into remote mode without scrubbing a dev-time `api-key` attribute
-// from the markup. Fire once per element to cap noise during HMR reloads.
+// on the transport. Fired only when the caller has *opted in* via
+// `forward-credentials="true"` — the default (no forwarding) silently strips
+// the key. Dev-mode only because the caller has explicitly acknowledged this
+// trade-off; production noise would be unhelpful.
 export function warnApiKeyInRemoteMode(): void {
   if (!isDevelopment()) return;
   if (typeof console === "undefined" || typeof console.warn !== "function") return;
 
   console.warn(
-    "[@csbc-dev/ai-agent] `api-key` attribute is set on <ai-agent> in remote mode. " +
-    "In remote mode the server is expected to hold provider credentials, and forwarding a client-side key over the WebSocket leaks the secret to transport observers. " +
-    "Remove the `api-key` attribute from the element (and `base-url` / `api-version` if they point at provider endpoints rather than your own proxy) before enabling remote mode."
+    "[@csbc-dev/ai-agent] `api-key` is being forwarded over the WebSocket because `forward-credentials` is enabled on a remote-mode <ai-agent>. " +
+    "Only do this if your server is a trusted transparent proxy that needs the per-request key — Case B1 deployments should hold the key server-side and leave `forward-credentials` off."
+  );
+}
+
+// Production-visible (console.error) one-time warning when `api-key` is set on
+// a remote-mode <ai-agent> but `forward-credentials` is *not* enabled. The key
+// is silently dropped from the wire payload (the secure default), but a caller
+// upgrading from 0.4.x — where the key was always forwarded — needs a loud
+// signal that their request topology changed. This is intentionally an `error`
+// rather than a `warn` so it shows up in default browser consoles and crash
+// reporters; the alternative (silent breakage) is worse than log noise.
+export function errorApiKeyDroppedInRemoteMode(): void {
+  if (typeof console === "undefined" || typeof console.error !== "function") return;
+
+  console.error(
+    "[@csbc-dev/ai-agent] `api-key` is set on a remote-mode <ai-agent> but `forward-credentials` is not enabled. " +
+    "The key is NOT being sent to the server (this is the secure default since 0.5). " +
+    "If your server expects the client to relay the key, add `forward-credentials=\"true\"` to the element. " +
+    "Otherwise, remove the `api-key` attribute and let the server hold the credentials."
   );
 }
 
@@ -95,6 +113,27 @@ export function warnToolArgumentsParseFailure(
     rawArguments,
     error,
   });
+}
+
+// Dev-mode signal for Anthropic requests that omit `maxTokens`. The Anthropic
+// API requires `max_tokens` and the provider falls back to a hard-coded 4096
+// to keep the request alive. Silently applying the default hides a real
+// configuration gap: a long-form completion will be truncated mid-sentence
+// without any error from the wire layer. Production keeps the 4096 fallback
+// (so deployments don't break on a forgotten field), but development warns
+// once per process so the author notices and sets an explicit budget.
+let _warnedAnthropicDefaultMaxTokens = false;
+export function warnAnthropicDefaultMaxTokens(defaultValue: number): void {
+  if (!isDevelopment()) return;
+  if (_warnedAnthropicDefaultMaxTokens) return;
+  if (typeof console === "undefined" || typeof console.warn !== "function") return;
+  _warnedAnthropicDefaultMaxTokens = true;
+
+  console.warn(
+    `[@csbc-dev/ai-agent] Anthropic request omitted maxTokens; falling back to ${defaultValue}. ` +
+    "Anthropic requires max_tokens on every request, and the default may truncate long completions. " +
+    "Set `maxTokens` (the `max-tokens` attribute or AiRequestOptions.maxTokens) explicitly for production use."
+  );
 }
 
 // Dev-mode signal for HMR / module-reload scenarios where a bundler re-executes
