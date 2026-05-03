@@ -3,13 +3,14 @@ import {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiProviderRequest,
   AiStreamChunkResult, AiToolCall, AiToolCallDelta, AiContent, AiFinishReason,
 } from "../types.js";
-import { validateRequestOptions } from "./validateRequestOptions.js";
+import { validateRequestOptions, normalizeBaseUrl } from "./validateRequestOptions.js";
 import { flattenContentToText } from "./contentHelpers.js";
 
 export class OpenAiProvider implements IAiProvider {
   buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {
     validateRequestOptions(options);
-    const baseUrl = options.baseUrl || "https://api.openai.com";
+    const isDefaultBaseUrl = !options.baseUrl;
+    const baseUrl = normalizeBaseUrl(options.baseUrl || "https://api.openai.com");
     const url = `${baseUrl}/v1/chat/completions`;
 
     const headers: Record<string, string> = {
@@ -27,8 +28,12 @@ export class OpenAiProvider implements IAiProvider {
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens;
     // stream_options is an OpenAI-specific extension; omit it for custom base URLs
-    // (e.g. Ollama, vLLM) where it may cause 400 errors.
-    if (body.stream && baseUrl === "https://api.openai.com") {
+    // (e.g. Ollama, vLLM) where it may cause 400 errors. Only emit when the
+    // caller did not override `baseUrl` — a user-supplied value, even one that
+    // happens to point at the official host, signals "I am taking control of
+    // the endpoint" and could be a transparent proxy that does not understand
+    // the option.
+    if (body.stream && isDefaultBaseUrl) {
       body.stream_options = { include_usage: true };
     }
     if (options.tools && options.tools.length > 0) {

@@ -129,7 +129,9 @@ export class AiCore extends EventTarget {
   private _provider: IAiProvider | null = null;
   private _abortController: AbortController | null = null;
   private _flushScheduled: boolean = false;
-  private _rafId: any = 0;
+  // Holds either a requestAnimationFrame handle or a setTimeout handle from the
+  // non-browser fallback in `_scheduleFlush`. `null` means "no pending flush".
+  private _rafId: ReturnType<typeof requestAnimationFrame> | ReturnType<typeof setTimeout> | null = null;
   // Instance-scoped tool handler registry. Takes precedence over the process-
   // wide registry so authenticated deployments can bind handlers to a specific
   // user/connection via `createCores` without the per-connection closures
@@ -264,16 +266,16 @@ export class AiCore extends EventTarget {
     const raf = globalThis.requestAnimationFrame ?? ((cb: FrameRequestCallback) => setTimeout(cb, 16));
     this._rafId = raf(() => {
       this._flushScheduled = false;
-      this._rafId = 0;
+      this._rafId = null;
       this._setContent(this._content);
     });
   }
 
   private _cancelFlush(): void {
-    if (this._rafId) {
+    if (this._rafId !== null) {
       const cancel = globalThis.cancelAnimationFrame ?? clearTimeout;
-      cancel(this._rafId);
-      this._rafId = 0;
+      cancel(this._rafId as any);
+      this._rafId = null;
       this._flushScheduled = false;
     }
   }

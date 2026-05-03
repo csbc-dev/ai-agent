@@ -25,7 +25,9 @@ export class SseParser {
       }
 
       if (line.startsWith("event:")) {
-        this._currentEvent = (line.startsWith("event: ") ? line.slice(7) : line.slice(6)).trim();
+        // SSE spec: strip a single leading U+0020 from the field value if
+        // present; do not trim trailing whitespace (it is part of the value).
+        this._currentEvent = line.startsWith("event: ") ? line.slice(7) : line.slice(6);
       } else if (line.startsWith("data:")) {
         const value = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
         this._currentData.push(value);
@@ -59,7 +61,7 @@ export class SseParser {
         const value = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
         this._currentData.push(value);
       } else if (line.startsWith("event:")) {
-        this._currentEvent = (line.startsWith("event: ") ? line.slice(7) : line.slice(6)).trim();
+        this._currentEvent = line.startsWith("event: ") ? line.slice(7) : line.slice(6);
       }
     }
     if (this._currentData.length > 0) {

@@ -15,7 +15,25 @@ function handleClick(event: Event): void {
   const aiElement = document.getElementById(aiId);
   if (!aiElement || aiElement.tagName.toLowerCase() !== config.tagNames.ai) return;
 
-  (aiElement as any).send().catch(() => {});
+  // Route early-failure rejections (e.g. AiCore's synchronous prompt/model
+  // validation, "_core not initialized" throws) through the element's error
+  // channel so consumers can observe them via `ai-agent:error`. Without this,
+  // autoTrigger silently swallows failures that did not transit AiCore's own
+  // error path.
+  //
+  // Guard against double-dispatch: AiCore (`_setError`) and the Shell
+  // (`_setErrorState`) already fire `ai-agent:error` on their own error
+  // paths, so re-dispatching here when `el.error` is already populated would
+  // produce a redundant second event for the same failure. We only dispatch
+  // when the rejection slipped past those channels and left `el.error` null.
+  const el = aiElement as any;
+  el.send().catch((e: unknown) => {
+    if (el.error != null) return;
+    el.dispatchEvent(new CustomEvent("ai-agent:error", {
+      detail: e instanceof Error ? e : new Error(String(e)),
+      bubbles: true,
+    }));
+  });
 }
 
 export function registerAutoTrigger(): void {

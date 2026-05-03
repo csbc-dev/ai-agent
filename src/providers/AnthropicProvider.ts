@@ -1,9 +1,9 @@
-import { warnStreamParseFailure } from "../debug.js";
+import { warnStreamParseFailure, warnToolArgumentsParseFailure } from "../debug.js";
 import {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiProviderRequest,
   AiStreamChunkResult, AiToolCall, AiContent, AiFinishReason,
 } from "../types.js";
-import { validateRequestOptions } from "./validateRequestOptions.js";
+import { validateRequestOptions, normalizeBaseUrl } from "./validateRequestOptions.js";
 import { flattenContentToText, parseDataUrl } from "./contentHelpers.js";
 
 // Reserved tool name used internally when emulating structured-output on
@@ -16,7 +16,7 @@ const STRUCTURED_OUTPUT_TOOL = "__wc_bindable_structured_response__";
 export class AnthropicProvider implements IAiProvider {
   buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {
     validateRequestOptions(options);
-    const baseUrl = options.baseUrl || "https://api.anthropic.com";
+    const baseUrl = normalizeBaseUrl(options.baseUrl || "https://api.anthropic.com");
     const url = `${baseUrl}/v1/messages`;
 
     const headers: Record<string, string> = {
@@ -85,7 +85,10 @@ export class AnthropicProvider implements IAiProvider {
       for (const tc of m.toolCalls) {
         let input: any = {};
         try { input = tc.arguments ? JSON.parse(tc.arguments) : {}; }
-        catch { input = {}; }
+        catch (error) {
+          warnToolArgumentsParseFailure("anthropic", tc.name, tc.arguments, error);
+          input = {};
+        }
         blocks.push({ type: "tool_use", id: tc.id, name: tc.name, input });
       }
       return { role: "assistant", content: blocks };

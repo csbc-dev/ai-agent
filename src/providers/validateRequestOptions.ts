@@ -22,3 +22,14 @@ export function validateRequestOptions(options: AiRequestOptions): void {
     }
   }
 }
+
+/**
+ * Strip a single trailing slash from a base URL so that path concatenation
+ * (`${baseUrl}/v1/...`) does not produce a doubled slash. Empty / absent
+ * values pass through unchanged so callers can keep `||` defaulting against
+ * a provider-specific fallback.
+ */
+export function normalizeBaseUrl(baseUrl: string): string {
+  if (!baseUrl) return baseUrl;
+  return baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+}

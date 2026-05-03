@@ -285,10 +285,6 @@ describe("Ai (ai-agent)", () => {
     expect(Ai.wcBindable.properties[6].name).toBe("trigger");
   });
 
-  it("hasConnectedCallbackPromiseがfalseである", () => {
-    expect(Ai.hasConnectedCallbackPromise).toBe(false);
-  });
-
   it("observedAttributesにproviderが含まれる", () => {
     expect(Ai.observedAttributes).toContain("provider");
   });

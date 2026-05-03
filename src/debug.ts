@@ -72,6 +72,31 @@ export function warnApiKeyInRemoteMode(): void {
   );
 }
 
+// Dev-mode signal for tool-call `arguments` JSON that fails to parse when a
+// provider serializer re-hydrates it on a subsequent turn (Anthropic's
+// `tool_use.input`, Google's `functionCall.args`). Silently falling back to
+// `{}` (the existing behavior) is correct for wire-format integrity but hides
+// upstream bugs: the model emitted partial JSON, the accumulator dropped a
+// fragment, or the caller hand-built a tool message with malformed args. Fire
+// only in development; production keeps the empty-object fallback so the loop
+// can still proceed.
+export function warnToolArgumentsParseFailure(
+  provider: string,
+  name: string,
+  rawArguments: string,
+  error: unknown
+): void {
+  if (!isDevelopment()) return;
+  if (typeof console === "undefined" || typeof console.warn !== "function") return;
+
+  console.warn("[@csbc-dev/ai-agent] Failed to parse tool_call arguments JSON; falling back to {}.", {
+    provider,
+    name,
+    rawArguments,
+    error,
+  });
+}
+
 // Dev-mode signal for HMR / module-reload scenarios where a bundler re-executes
 // the registering module and hands the registry a *different* handler reference
 // for the same tool name. In production this is a bootstrap-ordering bug worth

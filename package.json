@@ -63,8 +63,7 @@
   "author": "mogera551",
   "repository": {
     "type": "git",
-    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
-    "directory": "packages/ai"
+    "url": "https://github.com/csbc-dev/ai-agent.git"
   },
   "license": "MIT"
 }

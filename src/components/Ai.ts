@@ -1,6 +1,8 @@
 import { config, getRemoteCoreUrl } from "../config.js";
 import { warnApiKeyInRemoteMode } from "../debug.js";
-import { IWcBindable, AiMessage, AiHttpError } from "../types.js";
+import type {
+  IWcBindable, AiMessage, AiHttpError, AiContentPart, AiTool, AiToolChoice,
+} from "../types.js";
 import { AiCore } from "../core/AiCore.js";
 import { cloneMessage } from "../core/cloneMessage.js";
 import { validateMessages } from "../core/validateMessages.js";
@@ -15,7 +17,6 @@ import {
 import { bind } from "@wc-bindable/core";
 
 export class Ai extends HTMLElement {
-  static hasConnectedCallbackPromise = false;
   static wcBindable: IWcBindable = {
     ...AiCore.wcBindable,
     properties: [
@@ -34,9 +35,9 @@ export class Ai extends HTMLElement {
   private _ws: WebSocket | null = null;
   private _trigger: boolean = false;
   private _warnedApiKeyLeak: boolean = false;
-  private _prompt: string | import("../types.js").AiContentPart[] = "";
-  private _tools: import("../types.js").AiTool[] | null = null;
-  private _toolChoice: import("../types.js").AiToolChoice | undefined = undefined;
+  private _prompt: string | AiContentPart[] = "";
+  private _tools: AiTool[] | null = null;
+  private _toolChoice: AiToolChoice | undefined = undefined;
   private _maxToolRoundtrips: number | undefined = undefined;
   private _responseSchema: Record<string, any> | null = null;
   private _responseSchemaName: string | undefined = undefined;
@@ -270,14 +271,14 @@ export class Ai extends HTMLElement {
 
   // --- JS-only properties ---
 
-  get prompt(): string | import("../types.js").AiContentPart[] { return this._prompt; }
-  set prompt(value: string | import("../types.js").AiContentPart[]) { this._prompt = value; }
+  get prompt(): string | AiContentPart[] { return this._prompt; }
+  set prompt(value: string | AiContentPart[]) { this._prompt = value; }
 
-  get tools(): import("../types.js").AiTool[] | null { return this._tools; }
-  set tools(value: import("../types.js").AiTool[] | null) { this._tools = value; }
+  get tools(): AiTool[] | null { return this._tools; }
+  set tools(value: AiTool[] | null) { this._tools = value; }
 
-  get toolChoice(): import("../types.js").AiToolChoice | undefined { return this._toolChoice; }
-  set toolChoice(value: import("../types.js").AiToolChoice | undefined) { this._toolChoice = value; }
+  get toolChoice(): AiToolChoice | undefined { return this._toolChoice; }
+  set toolChoice(value: AiToolChoice | undefined) { this._toolChoice = value; }
 
   get maxToolRoundtrips(): number | undefined { return this._maxToolRoundtrips; }
   set maxToolRoundtrips(value: number | undefined) { this._maxToolRoundtrips = value; }
@@ -595,10 +596,10 @@ export class Ai extends HTMLElement {
   /** Revive a serialized Error (from remote JSON) back into an Error instance. */
   private static _reviveError(value: any): any {
     if (value == null || typeof value !== "object") return value;
-    // AiHttpError has 'status'; skip it.
+    // Serialized objects from JSON.parse are never Error instances, so the
+    // `instanceof Error` check is implicit. AiHttpError has 'status'; skip it.
     if ("status" in value) return value;
-    // Serialized Error has 'name' and 'message' but is not an Error instance.
-    if ("name" in value && "message" in value && !(value instanceof Error)) {
+    if ("name" in value && "message" in value) {
       const err = new Error(value.message);
       err.name = value.name;
       if (value.stack) err.stack = value.stack;

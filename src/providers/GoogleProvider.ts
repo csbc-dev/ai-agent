@@ -1,9 +1,9 @@
-import { warnStreamParseFailure } from "../debug.js";
+import { warnStreamParseFailure, warnToolArgumentsParseFailure } from "../debug.js";
 import {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiProviderRequest,
   AiStreamChunkResult, AiToolCall, AiToolCallDelta, AiContent, AiFinishReason,
 } from "../types.js";
-import { validateRequestOptions } from "./validateRequestOptions.js";
+import { validateRequestOptions, normalizeBaseUrl } from "./validateRequestOptions.js";
 import { flattenContentToText, parseDataUrl } from "./contentHelpers.js";
 
 // Synthetic id prefix for Gemini tool calls (Gemini's API does not supply ids;
@@ -19,7 +19,7 @@ export class GoogleProvider implements IAiProvider {
 
   buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {
     validateRequestOptions(options);
-    const baseUrl = options.baseUrl || "https://generativelanguage.googleapis.com";
+    const baseUrl = normalizeBaseUrl(options.baseUrl || "https://generativelanguage.googleapis.com");
     const stream = options.stream ?? true;
     // Gemini uses ?alt=sse to force SSE framing; without it, streaming endpoints
     // emit a chunked JSON array that SseParser cannot consume.
@@ -89,7 +89,10 @@ export class GoogleProvider implements IAiProvider {
         for (const tc of m.toolCalls) {
           let args: any = {};
           try { args = tc.arguments ? JSON.parse(tc.arguments) : {}; }
-          catch { args = {}; }
+          catch (error) {
+            warnToolArgumentsParseFailure("google", tc.name, tc.arguments, error);
+            args = {};
+          }
           // Echo a real Gemini-supplied id (Vertex / newer API versions) but
           // never ship our synthetic `gemini:<name>:<n>` fallback over the
           // wire — the server won't recognise it and might reject or mis-

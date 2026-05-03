@@ -630,7 +630,7 @@ describe("AiCore", () => {
 
       expect(contents).toEqual(["buffered"]);
       expect(coreAny._flushScheduled).toBe(false);
-      expect(coreAny._rafId).toBe(0);
+      expect(coreAny._rafId).toBeNull();
 
       globalThis.requestAnimationFrame = originalRaf;
       globalThis.cancelAnimationFrame = originalCancel;
@@ -660,7 +660,7 @@ describe("AiCore", () => {
 
       expect(contents).toEqual([]);
       expect(coreAny._flushScheduled).toBe(false);
-      expect(coreAny._rafId).toBe(0);
+      expect(coreAny._rafId).toBeNull();
 
       globalThis.requestAnimationFrame = originalRaf;
       globalThis.cancelAnimationFrame = originalCancel;

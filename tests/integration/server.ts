@@ -81,10 +81,20 @@ export function startServer(port: number): Promise<{
     const server = http.createServer((req, res) => {
       const url = req.url ?? "/";
 
-      // Route: /api/ai/* — mock OpenAI-compatible API
+      // Route: /api/ai/error* — always returns 500. Must precede the
+      // generic /api/ai handler below or the more-specific path is shadowed.
       if (url.startsWith("/api/ai/error")) {
-        // handled below
-      } else if (url.startsWith("/api/ai")) {
+        let body = "";
+        req.on("data", (chunk) => { body += chunk; });
+        req.on("end", () => {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        });
+        return;
+      }
+
+      // Route: /api/ai/* — mock OpenAI-compatible API
+      if (url.startsWith("/api/ai")) {
         let body = "";
         req.on("data", (chunk) => { body += chunk; });
         req.on("end", () => {
@@ -108,17 +118,6 @@ export function startServer(port: number): Promise<{
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Bad request" }));
           }
-        });
-        return;
-      }
-
-      // Route: /api/ai/error* — always returns 500
-      if (url.startsWith("/api/ai/error")) {
-        let body = "";
-        req.on("data", (chunk) => { body += chunk; });
-        req.on("end", () => {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
         });
         return;
       }

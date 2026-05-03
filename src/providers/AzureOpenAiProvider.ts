@@ -1,7 +1,7 @@
 import { AiMessage, AiRequestOptions, AiProviderRequest } from "../types.js";
 import { raiseError } from "../raiseError.js";
 import { OpenAiProvider } from "./OpenAiProvider.js";
-import { validateRequestOptions } from "./validateRequestOptions.js";
+import { validateRequestOptions, normalizeBaseUrl } from "./validateRequestOptions.js";
 
 export class AzureOpenAiProvider extends OpenAiProvider {
   override buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {
@@ -11,7 +11,8 @@ export class AzureOpenAiProvider extends OpenAiProvider {
     }
 
     const apiVersion = options.apiVersion || "2024-02-01";
-    const url = `${options.baseUrl}/openai/deployments/${options.model}/chat/completions?api-version=${apiVersion}`;
+    const baseUrl = normalizeBaseUrl(options.baseUrl);
+    const url = `${baseUrl}/openai/deployments/${options.model}/chat/completions?api-version=${apiVersion}`;
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
