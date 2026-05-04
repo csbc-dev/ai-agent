@@ -9,8 +9,14 @@ import { AiHttpError } from "./types.js";
  *
  * - `null` / `undefined` → `null`
  * - `Error` (any subclass) → returned as-is
- * - Plain object with a `status` property → treated as `AiHttpError`
+ * - Plain object that structurally matches `AiHttpError` (numeric `status`
+ *   plus `statusText`) → treated as `AiHttpError`
  * - Anything else → wrapped in `new Error(String(value))`
+ *
+ * The status/statusText pair is required because lone `status` properties
+ * appear on unrelated DOM types (`Response`, `XMLHttpRequest`,
+ * `MediaKeySession`, custom event payloads), and accepting them as
+ * AiHttpError would mis-shape the public `error` contract.
  *
  * Note: this helper does NOT wrap `Error` instances in `AiSerializableError`.
  * That wrapping is a Core-only concern (needed for JSON transport via
@@ -20,7 +26,13 @@ import { AiHttpError } from "./types.js";
 export function narrowError(error: unknown): AiHttpError | Error | null {
   if (error === null || error === undefined) return null;
   if (error instanceof Error) return error;
-  if (typeof error === "object" && error !== null && "status" in error) {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "status" in error &&
+    typeof (error as { status: unknown }).status === "number" &&
+    "statusText" in error
+  ) {
     return error as AiHttpError;
   }
   return new Error(String(error));

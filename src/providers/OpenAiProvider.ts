@@ -9,7 +9,6 @@ import { flattenContentToText } from "./contentHelpers.js";
 export class OpenAiProvider implements IAiProvider {
   buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {
     validateRequestOptions(options);
-    const isDefaultBaseUrl = !options.baseUrl;
     const baseUrl = normalizeBaseUrl(options.baseUrl || "https://api.openai.com");
     const url = `${baseUrl}/v1/chat/completions`;
 
@@ -20,9 +19,30 @@ export class OpenAiProvider implements IAiProvider {
       headers["Authorization"] = `Bearer ${options.apiKey}`;
     }
 
-    const body = this._buildBody(messages, options, { includeStreamOptions: isDefaultBaseUrl });
+    const body = this._buildBody(messages, options, {
+      includeStreamOptions: this._resolveIncludeStreamOptions(options),
+    });
 
     return { url, headers, body: JSON.stringify(body) };
+  }
+
+  /**
+   * Decide whether to emit `stream_options: { include_usage: true }`.
+   *
+   * - `streamOptions: "always"` → unconditional opt-in (use when a custom
+   *   `baseUrl` points at a transparent OpenAI proxy that supports the field
+   *   but you don't want usage silently dropped).
+   * - `streamOptions: "never"` → unconditional opt-out (use when your
+   *   OpenAI-compatible endpoint 400s on `stream_options`).
+   * - `"auto"` / unset → include only when no custom baseUrl is in play, on
+   *   the assumption that anything pointed away from api.openai.com might be
+   *   an incompatible proxy (older Ollama / vLLM, LiteLLM with strict
+   *   filtering). Conservative default: when in doubt, omit.
+   */
+  protected _resolveIncludeStreamOptions(options: AiRequestOptions): boolean {
+    if (options.streamOptions === "always") return true;
+    if (options.streamOptions === "never") return false;
+    return !options.baseUrl;
   }
 
   /**

@@ -1086,9 +1086,28 @@ describe("Ai (ai-agent)", () => {
 });
 
 describe("AiMessage (ai-message)", () => {
-  it("role属性のデフォルトはsystem", () => {
+  it("kind属性が無いときmessageKindのデフォルトはsystem", () => {
     const el = document.createElement("ai-message") as AiMessageElement;
-    expect(el.role).toBe("system");
+    expect(el.messageKind).toBe("system");
+  });
+
+  it("kind属性を読み取れる", () => {
+    const el = document.createElement("ai-message") as AiMessageElement;
+    el.setAttribute("kind", "assistant");
+    expect(el.messageKind).toBe("assistant");
+  });
+
+  it("legacy role属性をmessageKindのフォールバックとして読む", () => {
+    const el = document.createElement("ai-message") as AiMessageElement;
+    el.setAttribute("role", "user");
+    expect(el.messageKind).toBe("user");
+  });
+
+  it("kind属性がroleより優先される", () => {
+    const el = document.createElement("ai-message") as AiMessageElement;
+    el.setAttribute("role", "user");
+    el.setAttribute("kind", "assistant");
+    expect(el.messageKind).toBe("assistant");
   });
 
   it("messageContentでテキストを取得できる", () => {

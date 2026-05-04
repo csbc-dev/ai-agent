@@ -25,11 +25,15 @@ let _warnedShallowProviderHints = false;
  */
 function cloneProviderHints(hints: Record<string, any>): Record<string, any> {
   // Hints are a namespaced passthrough so shapes are provider-defined; deep
-  // clone via JSON round-trip to prevent external mutation of nested fields
-  // (e.g. `providerHints.anthropic.cacheControl`) from reaching back into
-  // the Core's stored history. Fall back to a shallow spread if a hint
-  // carries a non-JSON value (functions, BigInt) so we stay best-effort
-  // rather than throwing on an exotic payload.
+  // clone to prevent external mutation of nested fields (e.g.
+  // `providerHints.anthropic.cacheControl`) from reaching back into the
+  // Core's stored history. Prefer `structuredClone` (preserves Map/Set/Date
+  // and tolerates wider payloads); fall back to JSON round-trip; final
+  // fallback is a shallow spread so we stay best-effort rather than
+  // throwing on an exotic payload (functions, BigInt, circular refs).
+  if (typeof structuredClone === "function") {
+    try { return structuredClone(hints); } catch { /* fall through to JSON */ }
+  }
   try {
     return JSON.parse(JSON.stringify(hints));
   } catch (error) {

@@ -136,6 +136,88 @@ export function warnAnthropicDefaultMaxTokens(defaultValue: number): void {
   );
 }
 
+// One-shot dev warning when an `<ai-message role="...">` attribute is read,
+// nudging migration to the new `kind` attribute. The `role` attribute collides
+// with the W3C `HTMLElement.role` ARIA reflection (overriding it would
+// silently change the element's accessibility role to "system" / "user" /
+// etc., which are not valid ARIA roles); 0.5 introduces `kind` and 0.6 will
+// remove the `role` fallback. Warns once per page so HMR / repeated reads
+// don't spam the console.
+let _warnedAiMessageRoleAttribute = false;
+export function warnAiMessageRoleAttribute(): void {
+  if (!isDevelopment()) return;
+  if (_warnedAiMessageRoleAttribute) return;
+  if (typeof console === "undefined" || typeof console.warn !== "function") return;
+  _warnedAiMessageRoleAttribute = true;
+
+  console.warn(
+    "[@csbc-dev/ai-agent] <ai-message role=\"...\"> is deprecated since 0.5 and will be removed in 0.6 — " +
+    "rename the attribute to \"kind\" (e.g. <ai-message kind=\"user\">). " +
+    "The \"role\" attribute conflicts with the W3C HTMLElement.role ARIA reflection."
+  );
+}
+
+// Dev-mode warning for an `<ai-message>` whose kind/role value is not in the
+// known enum ("system" | "user" | "assistant" | "tool"). A typo silently
+// drops the element from <ai-agent> seeding and the prompt looks "off" with
+// no diagnostic, so we warn once per distinct value seen.
+const _warnedAiMessageUnknownKinds = new Set<string>();
+export function warnAiMessageUnknownKind(value: string, attr: "kind" | "role"): void {
+  if (!isDevelopment()) return;
+  if (typeof console === "undefined" || typeof console.warn !== "function") return;
+  const key = `${attr}:${value}`;
+  if (_warnedAiMessageUnknownKinds.has(key)) return;
+  _warnedAiMessageUnknownKinds.add(key);
+
+  console.warn(
+    `[@csbc-dev/ai-agent] <ai-message ${attr}="${value}"> uses an unknown ${attr}. ` +
+    "Expected one of \"system\", \"user\", \"assistant\", \"tool\". " +
+    "The element will be ignored by <ai-agent> seeding."
+  );
+}
+
+// One-shot warning when <ai-agent> connects but its `<ai-message>` partner
+// element is not registered. The most common cause is `import "@csbc-dev/ai-agent"`
+// followed by manual `customElements.define(..., Ai)` without an equivalent
+// call for AiMessageElement — system prompts and few-shot templates declared
+// as <ai-message> children then silently produce no seed. Use bootstrapAi()
+// or `import "@csbc-dev/ai-agent/auto"` to register both elements together.
+let _warnedAiPartnerMissing = false;
+export function warnAiPartnerMissing(aiTagName: string): void {
+  if (typeof console === "undefined" || typeof console.warn !== "function") return;
+  if (_warnedAiPartnerMissing) return;
+  _warnedAiPartnerMissing = true;
+
+  console.warn(
+    `[@csbc-dev/ai-agent] <${aiTagName}> upgraded but the <ai-message> partner element is not registered. ` +
+    "<ai-message> children for system prompts and few-shot templates will be ignored. " +
+    "Call bootstrapAi() (or `import \"@csbc-dev/ai-agent/auto\"`) to register both elements together."
+  );
+}
+
+// One-shot warning when <ai-agent>'s connectedCallback fires for a constructor
+// that customElements does not recognize. Standard custom-element lifecycle
+// makes this combination impossible (an unregistered class never gets
+// `connectedCallback` called), so it only surfaces in exotic setups: a test
+// that monkey-patches the prototype, a subclass that delegates lifecycle
+// without itself being registered, or a bundler/HMR race. Production-visible
+// (no isDevelopment gate) because by definition this signals a broken
+// integration — silent failure is worse than log noise.
+let _warnedAiClassUnregistered = false;
+export function warnAiClassUnregistered(tagName: string): void {
+  if (typeof console === "undefined" || typeof console.warn !== "function") return;
+  if (_warnedAiClassUnregistered) return;
+  _warnedAiClassUnregistered = true;
+
+  console.warn(
+    `[@csbc-dev/ai-agent] <${tagName}> connectedCallback fired but the Ai class itself is not registered. ` +
+    "This usually means the class was used outside the standard custom-element lifecycle (manual prototype call, " +
+    "test harness, etc.). If you import the package main module without `bootstrapAi()` and write <ai-agent> in HTML, " +
+    "the element stays a plain HTMLElement and this warning never fires — call bootstrapAi() or " +
+    "`import \"@csbc-dev/ai-agent/auto\"` to register the elements."
+  );
+}
+
 // Dev-mode signal for HMR / module-reload scenarios where a bundler re-executes
 // the registering module and hands the registry a *different* handler reference
 // for the same tool name. In production this is a bootstrap-ordering bug worth

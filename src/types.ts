@@ -194,6 +194,25 @@ export interface AiRequestOptions {
   // Optional name tag forwarded to providers that accept it (OpenAI's
   // json_schema.name). Defaults to "response".
   responseSchemaName?: string;
+  // OpenAI / Azure / OpenAI-compatible-only knob: how to emit
+  // `stream_options: { include_usage: true }` in the request body. Required
+  // to receive `usage` in streamed responses against the official OpenAI
+  // endpoint, but rejected with HTTP 400 by some compatible servers
+  // (older Ollama / vLLM builds, certain proxies).
+  //
+  // - `"auto"` (default): include only when `baseUrl` is unset, i.e.
+  //   exactly when we know the endpoint is the official api.openai.com.
+  //   Custom base URLs (proxies, gateways, OpenAI-compatible servers) are
+  //   treated as potentially-incompatible and the field is omitted.
+  // - `"always"`: include unconditionally. Use this when your custom
+  //   `baseUrl` points at a transparent OpenAI proxy that supports the
+  //   field — without it, streaming `usage` is silently dropped.
+  // - `"never"`: never include. Use this when you're hitting an
+  //   OpenAI-compatible server that 400s on `stream_options`.
+  //
+  // Other providers (Anthropic, Google) do not use `stream_options` and
+  // ignore this field.
+  streamOptions?: "auto" | "always" | "never";
 }
 
 export interface AiProviderRequest {

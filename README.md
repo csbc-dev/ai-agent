@@ -127,7 +127,7 @@ Add `no-stream` to disable streaming and receive the complete response at once:
   model="claude-sonnet-4-20250514"
   base-url="/api/anthropic"
   max-tokens="4096">
-  <ai-message role="system">You are a concise coding assistant.</ai-message>
+  <ai-message kind="system">You are a concise coding assistant.</ai-message>
 </ai-agent>
 ```
 
@@ -165,7 +165,7 @@ The URL is constructed as `{base-url}/openai/deployments/{model}/chat/completion
   provider="google"
   model="gemini-2.5-flash"
   base-url="/api/gemini">
-  <ai-message role="system">You are a concise coding assistant.</ai-message>
+  <ai-message kind="system">You are a concise coding assistant.</ai-message>
 </ai-agent>
 ```
 
@@ -747,14 +747,16 @@ Event delegation is used — works with dynamically added elements.
 
 Declarative prompt content. Two use cases in a single element:
 
-| `role` | Behavior |
+| `kind` | Behavior |
 |---|---|
 | `system` (default) | Becomes `options.system` for every `send()`. If the `system` attribute is set on `<ai-agent>`, that attribute wins and this element is ignored. Only the first such child is used. |
 | `user` / `assistant` | Seeded into `messages` at `connectedCallback` time as a **few-shot template**. All such children are collected in document order. Seeding is skipped if `messages` was set programmatically before connect, or in remote mode (the server owns conversation state). |
 
+> **Renamed in 0.5: `role` → `kind`.** The legacy `role` attribute is still read as a fallback (with a one-shot dev console warning) and will be removed in 0.6. Reason: the W3C `HTMLElement.role` ARIA reflection collides with custom values like `"system"` / `"user"`; using `kind` keeps the accessibility tree clean.
+
 The message content is taken from the element's text content with `String.prototype.trim()` applied — leading/trailing whitespace and indentation newlines from HTML authoring are stripped, so `<ai-message>\n  Hello\n</ai-message>` seeds `"Hello"`. If you need literal trailing whitespace in a few-shot example, set `messages` programmatically instead. Shadow DOM suppresses rendering. Whitespace-only children are skipped during seeding.
 
-**Ordering contract.** On `connectedCallback`, children are walked once in **document order**. The first `role="system"` child (or a role-less child) becomes `options.system`; all `role="user"` / `role="assistant"` children are concatenated into the seed `messages` array in the order they appear. System and user/assistant children can therefore be interleaved in markup without affecting the seeded conversation — the system-prompt and history channels are independent.
+**Ordering contract.** On `connectedCallback`, children are walked once in **document order**. The first child whose `kind` resolves to `"system"` (explicit `kind="system"` or no `kind` attribute at all) becomes `options.system`; all `kind="user"` / `kind="assistant"` children are concatenated into the seed `messages` array in the order they appear. System and user/assistant children can therefore be interleaved in markup without affecting the seeded conversation — the system-prompt and history channels are independent.
 
 **Dynamic `<ai-message>` additions after connect are not re-seeded.** Seeding runs once, right after `connectedCallback` in a microtask (so children constructed imperatively before `appendChild` have time to upgrade). Children added after that point are ignored — to grow a few-shot template dynamically, push directly to `el.messages`:
 
@@ -765,7 +767,7 @@ el.messages = [...el.messages, { role: "user", content: "..." }, { role: "assist
 ```html
 <!-- System prompt only -->
 <ai-agent provider="openai" model="gpt-4o" base-url="/api/ai">
-  <ai-message role="system">
+  <ai-message kind="system">
     You are a helpful coding assistant.
     Always provide TypeScript examples.
   </ai-message>
@@ -773,11 +775,11 @@ el.messages = [...el.messages, { role: "user", content: "..." }, { role: "assist
 
 <!-- Few-shot template: system + example turn -->
 <ai-agent provider="openai" model="gpt-4o" base-url="/api/ai">
-  <ai-message role="system">Translate English to French. Reply with the translation only.</ai-message>
-  <ai-message role="user">Hello</ai-message>
-  <ai-message role="assistant">Bonjour</ai-message>
-  <ai-message role="user">Good morning</ai-message>
-  <ai-message role="assistant">Bonjour</ai-message>
+  <ai-message kind="system">Translate English to French. Reply with the translation only.</ai-message>
+  <ai-message kind="user">Hello</ai-message>
+  <ai-message kind="assistant">Bonjour</ai-message>
+  <ai-message kind="user">Good morning</ai-message>
+  <ai-message kind="assistant">Bonjour</ai-message>
 </ai-agent>
 ```
 
@@ -966,7 +968,7 @@ import "@csbc-dev/ai-agent/auto/remoteEnv";
 In **local mode**, the Core is created in the constructor, so setting `el.messages = [...]` or `el.prompt = "..."` before appending the element to the DOM works (the Core stores them). In **remote mode**, the proxy is opened in `connectedCallback`, so:
 
 - Setting `el.messages = [...]` before the element is connected is a no-op (the proxy does not exist to receive the write).
-- Append the element to the DOM first, wait for the initial sync (`ai-agent:messages-changed` fires), then set imperative state. Or use the declarative DOM form (`<ai-message role="user">…</ai-message>` children) for an initial prompt — note that those are not seeded in remote mode either; the server owns conversation state.
+- Append the element to the DOM first, wait for the initial sync (`ai-agent:messages-changed` fires), then set imperative state. Or use the declarative DOM form (`<ai-message kind="user">…</ai-message>` children) for an initial prompt — note that those are not seeded in remote mode either; the server owns conversation state.
 
 ### `remoteSettingType`
 
@@ -1274,7 +1276,27 @@ interface WcsAiValues extends WcsAiCoreValues {
 - Endpoint: `{base-url}/v1/chat/completions`
 - Auth: `Authorization: Bearer {api-key}`
 - Streaming: SSE with `data: {"choices":[{"delta":{"content":"..."}}]}` and `data: [DONE]`
-- Usage: `stream_options: { include_usage: true }` requests usage in the final chunk
+- Usage: `stream_options: { include_usage: true }` requests usage in the final chunk. Emitted **only when `base-url` is unset by default** — custom `base-url` values are treated as potentially-incompatible (older Ollama / vLLM builds 400 on the field), so streaming `usage` is silently dropped against a transparent OpenAI proxy unless you opt in via `stream-options="always"`. See below.
+
+#### `stream-options` attribute
+
+OpenAI / Azure / OpenAI-compatible-only knob controlling the `stream_options` request field:
+
+| Value | Effect |
+|---|---|
+| `auto` (default) | Include `stream_options` only when `base-url` is unset (i.e. talking to api.openai.com directly). |
+| `always` | Always include. Use when `base-url` points at a transparent OpenAI proxy that supports the field — without this, streaming `usage` is silently dropped. |
+| `never` | Never include. Use when your OpenAI-compatible endpoint 400s on `stream_options`. |
+
+```html
+<!-- Custom proxy that supports stream_options; force-include so usage works -->
+<ai-agent provider="openai" base-url="/api/ai" model="gpt-4o" stream-options="always"></ai-agent>
+
+<!-- OpenAI-compatible server that rejects stream_options -->
+<ai-agent provider="openai" base-url="http://localhost:11434" model="llama3" stream-options="never"></ai-agent>
+```
+
+The same control is available as `AiRequestOptions.streamOptions` for direct `AiCore` users. Anthropic and Google ignore it.
 
 ### Anthropic
 
@@ -1428,14 +1450,14 @@ if (last?.role === "assistant" && last.finishReason === "safety") {
 - on error, the user message is removed from history to keep it clean for retry
 - a new `send()` automatically aborts any in-flight request
 - `messages` is both readable (output state) and writable (for history reset/restore)
-- `system` attribute takes priority over `<ai-message role="system">`
+- `system` attribute takes priority over `<ai-message kind="system">`
 - Anthropic's `max_tokens` defaults to 4096 if not specified
 - Google (Gemini) uses distinct endpoints for streaming (`:streamGenerateContent?alt=sse`) vs non-streaming (`:generateContent`); the `assistant` role is translated to `model` on the wire; stream end is signalled by `candidates[0].finishReason` rather than a `[DONE]` sentinel; multimodal image input is accepted as `data:` URLs (http(s) URLs throw at `buildRequest`); a server-supplied `functionCall.id` is preserved verbatim for Vertex AI parallel-call disambiguation, with a synthetic `gemini:<name>:<counter>` id used internally as fallback and stripped before serialization
 - tool use runs an auto-loop inside `AiCore.send()`: handlers execute in parallel via `Promise.all`, results are appended as `role: "tool"` messages, and the loop re-fetches until the model stops requesting tools or `maxToolRoundtrips` (default 10) is hit
 - handler errors and unknown tool names are captured into the tool message payload so the model can recover, instead of rejecting `send()` — only `maxToolRoundtrips` exhaustion and abort surface as terminal errors
 - `registerTool(name, handler)` provides a process-wide registry that `AiCore` consults when `tool.handler` is absent — this is how remote mode resolves handlers after the Shell strips functions from the wire payload
 - `responseSchema` constrains the final response to a JSON object: OpenAI/Azure/Google translate to their native schema fields; Anthropic is emulated via a synthetic forced `tool_use` and unwrapped back into a JSON content string. Forcing non-streaming on Anthropic is intentional — streaming input_json_delta deltas reliably across stateless chunk parsing is out of scope for v1. Mutually exclusive with `tools`.
-- `<ai-message role="user|assistant">` children seed the initial `messages` history at `connectedCallback` for few-shot templates; `role="system"` children continue to flow through `_collectSystem()` into `options.system` on each send. Seeding is skipped when `messages` was set programmatically before connect or in remote mode (server-owned state).
+- `<ai-message kind="user|assistant">` children seed the initial `messages` history at `connectedCallback` for few-shot templates; `kind="system"` children continue to flow through `_collectSystem()` into `options.system` on each send. Seeding is skipped when `messages` was set programmatically before connect or in remote mode (server-owned state). The legacy `role` attribute is read as a fallback (deprecated since 0.5, removed in 0.6).
 - multimodal input widens `AiMessage.content` from `string` to `string | AiContentPart[]`; only `user` messages carry mixed parts on the wire (assistant/system/tool with array content are flattened to concatenated text). Google (Gemini) accepts only `data:` URLs for images — http(s) URLs throw at `buildRequest` with a clear message, rather than letting the API return a cryptic 400.
 - stored assistant messages carry a normalized `finishReason` (`"stop" | "length" | "tool_use" | "safety" | "other"`) — providers map their native `finish_reason` / `stop_reason` / `finishReason` vocabularies into this union; unknown values collapse to `"other"` so the field stays forward-compatible. Safety refusals reach the consumer through this field, not through `el.error` (see [Error contract §Safety refusals](#safety-refusals-are-not-errors))
 - `AiMessage.providerHints` is a namespaced passthrough for provider-specific wire fields (Anthropic prompt caching via `providerHints.anthropic.cacheControl`; see [Provider details §Provider hints](#provider-hints)). Other providers silently ignore unknown namespaces, so the same history is safe to flow through any provider without per-site shaping

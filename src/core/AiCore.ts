@@ -343,6 +343,14 @@ export class AiCore extends EventTarget {
         raiseError("responseSchema and tools cannot both be set on the same send() call. Structured output and tool use are mutually exclusive in this API.");
       }
     }
+    if (
+      options.streamOptions !== undefined &&
+      options.streamOptions !== "auto" &&
+      options.streamOptions !== "always" &&
+      options.streamOptions !== "never"
+    ) {
+      raiseError(`streamOptions must be "auto", "always", or "never"; got ${JSON.stringify(options.streamOptions)}.`);
+    }
     return this._doSend(prompt, options);
   }
 

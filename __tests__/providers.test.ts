@@ -92,6 +92,40 @@ describe("OpenAiProvider", () => {
       expect(body.stream_options).toBeUndefined();
     });
 
+    it("streamOptions=alwaysでカスタムbaseUrlでもstream_optionsを含む", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gpt-4o", baseUrl: "/api/ai", streamOptions: "always" }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.stream_options).toEqual({ include_usage: true });
+    });
+
+    it("streamOptions=neverでデフォルトbaseUrlでもstream_optionsを含まない", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gpt-4o", streamOptions: "never" }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.stream_options).toBeUndefined();
+    });
+
+    it("streamOptions=autoは既存ヒューリスティクスと同じ", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gpt-4o", baseUrl: "/api/ai", streamOptions: "auto" }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.stream_options).toBeUndefined();
+    });
+
+    it("不正なstreamOptions値はbuildRequestがthrowする", () => {
+      expect(() => provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gpt-4o", streamOptions: "yes" as any }
+      )).toThrow(/streamOptions must be/);
+    });
+
     it("無効なtemperature/maxTokensはエラーをスローする", () => {
       expect(() => provider.buildRequest(
         [{ role: "user", content: "Hi" }],

@@ -1,5 +1,8 @@
 import { config, getRemoteCoreUrl } from "../config.js";
-import { warnApiKeyInRemoteMode, errorApiKeyDroppedInRemoteMode } from "../debug.js";
+import {
+  warnApiKeyInRemoteMode, errorApiKeyDroppedInRemoteMode,
+  warnAiPartnerMissing, warnAiClassUnregistered,
+} from "../debug.js";
 import type {
   IWcBindable, AiMessage, AiHttpError, AiContentPart, AiTool, AiToolChoice,
 } from "../types.js";
@@ -281,6 +284,32 @@ export class Ai extends HTMLElement {
   }
 
   /**
+   * OpenAI / Azure / OpenAI-compatible-only knob. Controls whether
+   * `stream_options: { include_usage: true }` is emitted in the request body.
+   *
+   * - `"auto"` (default when attribute absent): include only when `base-url` is unset.
+   * - `"always"`: include unconditionally — use with a transparent proxy that
+   *   supports the field, otherwise streaming `usage` is silently dropped.
+   * - `"never"`: never include — use with OpenAI-compatible servers that 400
+   *   on `stream_options`.
+   *
+   * Invalid values are ignored (treated as `undefined` → "auto").
+   */
+  get streamOptions(): "auto" | "always" | "never" | undefined {
+    const v = this.getAttribute("stream-options");
+    if (v === "auto" || v === "always" || v === "never") return v;
+    return undefined;
+  }
+
+  set streamOptions(value: "auto" | "always" | "never" | undefined) {
+    if (value === undefined) {
+      this.removeAttribute("stream-options");
+    } else {
+      this.setAttribute("stream-options", value);
+    }
+  }
+
+  /**
    * In remote mode, controls whether the client-side `apiKey` / `baseUrl` /
    * `apiVersion` attributes are sent to the server in the `send()` payload.
    *
@@ -456,11 +485,17 @@ export class Ai extends HTMLElement {
   private _collectSystem(): string {
     // system属性が優先
     if (this.system) return this.system;
-    // 子要素から収集（role="system" の最初の要素のみ。role未指定もsystem扱い）
+    // First <ai-message> child whose `messageKind` resolves to "system"
+    // (explicit kind="system", legacy role="system", or no attribute at all).
+    // Walked in JS rather than via a CSS selector so the dev-mode deprecation
+    // warning on `role=` and the unknown-kind warning fire from the
+    // AiMessageElement getter exactly once per element.
     const tag = config.tagNames.aiMessage;
-    const msgEl = this.querySelector<AiMessageElement>(`${tag}[role="system"], ${tag}:not([role])`);
-    if (msgEl) {
-      return msgEl.messageContent;
+    const els = Array.from(this.querySelectorAll<AiMessageElement>(tag));
+    for (const el of els) {
+      if (el.messageKind === "system") {
+        return el.messageContent;
+      }
     }
     return "";
   }
@@ -488,10 +523,10 @@ export class Ai extends HTMLElement {
     const els = Array.from(this.querySelectorAll<AiMessageElement>(tag));
     const seed: AiMessage[] = [];
     for (const el of els) {
-      const role = el.role;
-      if (role === "user" || role === "assistant") {
+      const kind = el.messageKind;
+      if (kind === "user" || kind === "assistant") {
         const content = el.messageContent;
-        if (content) seed.push({ role, content });
+        if (content) seed.push({ role: kind, content });
       }
     }
     if (seed.length > 0) {
@@ -558,6 +593,7 @@ export class Ai extends HTMLElement {
           maxToolRoundtrips: this._maxToolRoundtrips,
           responseSchema: this._responseSchema ?? undefined,
           responseSchemaName: this._responseSchemaName,
+          streamOptions: this.streamOptions,
         }], { timeoutMs: 0 }) as string | null;
       } catch (e) {
         if (Ai._isTransportError(e)) {
@@ -590,6 +626,7 @@ export class Ai extends HTMLElement {
       ...(this._maxToolRoundtrips !== undefined ? { maxToolRoundtrips: this._maxToolRoundtrips } : {}),
       ...(this._responseSchema !== null ? { responseSchema: this._responseSchema } : {}),
       ...(this._responseSchemaName !== undefined ? { responseSchemaName: this._responseSchemaName } : {}),
+      ...(this.streamOptions !== undefined ? { streamOptions: this.streamOptions } : {}),
     });
   }
 
@@ -605,6 +642,7 @@ export class Ai extends HTMLElement {
 
   connectedCallback(): void {
     this.style.display = "none";
+    Ai._verifyRegistration(this.tagName.toLowerCase());
     if (config.remote.enableRemote && !this._isRemote) {
       try {
         this._initRemote();
@@ -652,6 +690,28 @@ export class Ai extends HTMLElement {
     if (this._autoTriggerRegistered) {
       unregisterAutoTrigger();
       this._autoTriggerRegistered = false;
+    }
+  }
+
+  /**
+   * Sanity check that bootstrap registered both elements together. Catches
+   * the case where a consumer manually calls `customElements.define(..., Ai)`
+   * but skips AiMessageElement — system / few-shot children then silently
+   * produce no seed. Cannot catch the much more common `import "@csbc-dev/ai-agent"`
+   * without bootstrapAi() trap because in that case Ai is never registered
+   * and connectedCallback never fires; that path is documented in README
+   * §Quick Start as the reason `/auto` exists.
+   */
+  private static _verifyRegistration(tagName: string): void {
+    if (typeof customElements === "undefined") return;
+    const getName = (customElements as unknown as { getName?: (c: CustomElementConstructor) => string | null }).getName;
+    if (typeof getName !== "function") return;
+    if (getName.call(customElements, Ai) == null) {
+      warnAiClassUnregistered(tagName);
+      return;
+    }
+    if (getName.call(customElements, AiMessageElement) == null) {
+      warnAiPartnerMissing(tagName);
     }
   }
 
