@@ -50,7 +50,17 @@ class ServerAiCore extends AiCore {
     return super.send(prompt, {
       ...options,
       apiKey,
-      baseUrl: baseUrl || options.baseUrl,
+      // `baseUrl` is the *destination* of the server-held `apiKey`, so it must
+      // be locked to the same trust boundary as the key itself — never fall
+      // back to the (untrusted) client value. Otherwise, with AI_API_KEY set
+      // but AI_BASE_URL empty, a client could send baseUrl=https://attacker/v1
+      // and have the real key delivered to an attacker-controlled endpoint.
+      // This is why it differs from `model`/`system` below: those only affect
+      // cost/behavior, not where the credential travels. Empty string lets the
+      // provider fall back to its default endpoint (e.g. api.openai.com).
+      // To allow client-supplied endpoints in production, validate against an
+      // allowlist here instead of accepting an arbitrary value.
+      baseUrl,
       model: model || options.model,
       system: system || options.system,
     });
