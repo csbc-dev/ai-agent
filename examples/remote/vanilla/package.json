@@ -1,0 +1,18 @@
+{
+  "name": "csbc-ai-agent-example-remote-vanilla",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@csbc-dev/ai-agent": "file:../../..",
+    "@wc-bindable/core": "^0.4.0"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "csbc-ai-agent-example-remote-server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --env-file-if-exists=.env --watch server.js"
+  },
+  "dependencies": {
+    "@csbc-dev/ai-agent": "file:../../..",
+    "@wc-bindable/remote": "^0.4.0",
+    "ws": "^8.20.0"
+  }
+}
