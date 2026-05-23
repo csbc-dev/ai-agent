@@ -531,7 +531,7 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("model", "gpt-4o");
       el.stream = false;
       const msgEl = document.createElement("ai-message") as AiMessageElement;
-      msgEl.setAttribute("role", "system");
+      msgEl.setAttribute("kind", "system");
       msgEl.textContent = "You are a helpful assistant.";
       el.appendChild(msgEl);
       document.body.appendChild(el);
@@ -554,7 +554,7 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("system", "Priority system");
       el.stream = false;
       const msgEl = document.createElement("ai-message") as AiMessageElement;
-      msgEl.setAttribute("role", "system");
+      msgEl.setAttribute("kind", "system");
       msgEl.textContent = "Fallback system";
       el.appendChild(msgEl);
       document.body.appendChild(el);
@@ -577,12 +577,12 @@ describe("Ai (ai-agent)", () => {
       el.stream = false;
 
       const userMsg = document.createElement("ai-message") as AiMessageElement;
-      userMsg.setAttribute("role", "user");
+      userMsg.setAttribute("kind", "user");
       userMsg.textContent = "Initial user message";
       el.appendChild(userMsg);
 
       const sysMsg = document.createElement("ai-message") as AiMessageElement;
-      sysMsg.setAttribute("role", "system");
+      sysMsg.setAttribute("kind", "system");
       sysMsg.textContent = "System prompt";
       el.appendChild(sysMsg);
 
@@ -595,7 +595,7 @@ describe("Ai (ai-agent)", () => {
       expect(body.messages[0].content).toBe("System prompt");
     });
 
-    it("role='user'/'assistant'の子要素をmessagesにseedする（few-shot）", async () => {
+    it("kind='user'/'assistant'の子要素をmessagesにseedする（few-shot）", async () => {
       fetchSpy.mockResolvedValueOnce(createMockResponse({
         choices: [{ message: { content: "OK" } }],
       }));
@@ -606,12 +606,12 @@ describe("Ai (ai-agent)", () => {
       el.stream = false;
 
       const u1 = document.createElement("ai-message") as AiMessageElement;
-      u1.setAttribute("role", "user");
+      u1.setAttribute("kind", "user");
       u1.textContent = "What is 2+2?";
       el.appendChild(u1);
 
       const a1 = document.createElement("ai-message") as AiMessageElement;
-      a1.setAttribute("role", "assistant");
+      a1.setAttribute("kind", "assistant");
       a1.textContent = "4.";
       el.appendChild(a1);
 
@@ -647,12 +647,12 @@ describe("Ai (ai-agent)", () => {
       el.stream = false;
 
       const sys = document.createElement("ai-message") as AiMessageElement;
-      sys.setAttribute("role", "system");
+      sys.setAttribute("kind", "system");
       sys.textContent = "Be terse.";
       el.appendChild(sys);
 
       const u = document.createElement("ai-message") as AiMessageElement;
-      u.setAttribute("role", "user");
+      u.setAttribute("kind", "user");
       u.textContent = "Hi";
       el.appendChild(u);
 
@@ -681,7 +681,7 @@ describe("Ai (ai-agent)", () => {
 
       // 後からDOMにfew-shot子要素を追加
       const u = document.createElement("ai-message") as AiMessageElement;
-      u.setAttribute("role", "user");
+      u.setAttribute("kind", "user");
       u.textContent = "from-dom";
       el.appendChild(u);
 
@@ -698,12 +698,12 @@ describe("Ai (ai-agent)", () => {
       el.setAttribute("model", "gpt-4o");
 
       const empty = document.createElement("ai-message") as AiMessageElement;
-      empty.setAttribute("role", "user");
+      empty.setAttribute("kind", "user");
       empty.textContent = "   "; // whitespace only
       el.appendChild(empty);
 
       const real = document.createElement("ai-message") as AiMessageElement;
-      real.setAttribute("role", "user");
+      real.setAttribute("kind", "user");
       real.textContent = "real content";
       el.appendChild(real);
 
@@ -1097,17 +1097,15 @@ describe("AiMessage (ai-message)", () => {
     expect(el.messageKind).toBe("assistant");
   });
 
-  it("legacy role属性をmessageKindのフォールバックとして読む", () => {
+  it("role属性はkindのフォールバックにならない（kind未指定ならsystem、deprecation警告も出ない）", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const el = document.createElement("ai-message") as AiMessageElement;
     el.setAttribute("role", "user");
-    expect(el.messageKind).toBe("user");
-  });
-
-  it("kind属性がroleより優先される", () => {
-    const el = document.createElement("ai-message") as AiMessageElement;
-    el.setAttribute("role", "user");
-    el.setAttribute("kind", "assistant");
-    expect(el.messageKind).toBe("assistant");
+    expect(el.messageKind).toBe("system");
+    // シム削除後、role 属性は一切読まれず deprecation 警告も発火しない
+    // （vitest は import.meta.env.DEV=true なので、発火するなら必ず捕捉される）
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 
   it("messageContentでテキストを取得できる", () => {

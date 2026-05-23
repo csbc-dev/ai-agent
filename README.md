@@ -752,7 +752,7 @@ Declarative prompt content. Two use cases in a single element:
 | `system` (default) | Becomes `options.system` for every `send()`. If the `system` attribute is set on `<ai-agent>`, that attribute wins and this element is ignored. Only the first such child is used. |
 | `user` / `assistant` | Seeded into `messages` at `connectedCallback` time as a **few-shot template**. All such children are collected in document order. Seeding is skipped if `messages` was set programmatically before connect, or in remote mode (the server owns conversation state). |
 
-> **Renamed in 0.5: `role` → `kind`.** The legacy `role` attribute is still read as a fallback (with a one-shot dev console warning) and will be removed in 0.6. Reason: the W3C `HTMLElement.role` ARIA reflection collides with custom values like `"system"` / `"user"`; using `kind` keeps the accessibility tree clean.
+> **Why `kind`, not `role`?** The W3C `HTMLElement.role` ARIA reflection collides with custom values like `"system"` / `"user"`, which are not valid ARIA roles and would pollute the accessibility tree. `<ai-message>` therefore uses `kind`; a bare `role` attribute is ignored (an `<ai-message>` with only `role="user"` resolves to the `"system"` default).
 
 The message content is taken from the element's text content with `String.prototype.trim()` applied — leading/trailing whitespace and indentation newlines from HTML authoring are stripped, so `<ai-message>\n  Hello\n</ai-message>` seeds `"Hello"`. If you need literal trailing whitespace in a few-shot example, set `messages` programmatically instead. Shadow DOM suppresses rendering. Whitespace-only children are skipped during seeding.
 
@@ -826,11 +826,11 @@ Since `<ai-agent>` is CSBC + `wc-bindable-protocol`, it works with any framework
 
 ```tsx
 import { useWcBindable } from "@wc-bindable/react";
-import type { WcsAiValues } from "@csbc-dev/ai-agent";
+import type { AiAgentValues } from "@csbc-dev/ai-agent";
 
 function Chat() {
   const [ref, { content, messages, loading, streaming }] =
-    useWcBindable<HTMLElement, WcsAiValues>();
+    useWcBindable<HTMLElement, AiAgentValues>();
 
   return (
     <>
@@ -851,9 +851,9 @@ function Chat() {
 ```vue
 <script setup lang="ts">
 import { useWcBindable } from "@wc-bindable/vue";
-import type { WcsAiValues } from "@csbc-dev/ai-agent";
+import type { AiAgentValues } from "@csbc-dev/ai-agent";
 
-const { ref, values } = useWcBindable<HTMLElement, WcsAiValues>();
+const { ref, values } = useWcBindable<HTMLElement, AiAgentValues>();
 </script>
 
 <template>
@@ -1022,7 +1022,7 @@ Behavior summary:
 | yes | `false` (default) | no creds | one-time `console.error` per element (production-visible — set `forward-credentials="true"` if you actually want forwarding) |
 | yes | `true` | `apiKey` / `baseUrl` / `apiVersion` included | one-time dev-mode `console.warn` (acknowledgement that you're forwarding a secret) |
 
-> **Migration from 0.4.x:** previously, remote mode forwarded credentials by default. The 0.5 default is now "do not forward." If you relied on the old behavior (server-as-transparent-proxy), add `forward-credentials="true"` explicitly. The production `console.error` is intentionally loud so the regression surfaces immediately during upgrade.
+> **Secure by default.** Remote mode does **not** forward client-side credentials. If you set `api-key` on a remote-mode `<ai-agent>` without `forward-credentials="true"`, the key is stripped from the wire payload and a production-visible `console.error` fires once per element so the silent drop is never a surprise. Only opt in when your server is a trusted transparent proxy that genuinely needs the per-request key.
 
 `forwardCredentials` is also exposed as a JS property:
 
@@ -1198,7 +1198,7 @@ bootstrapAi({
 import type {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions,
   AiProviderRequest, AiStreamChunkResult,
-  AiHttpError, WcsAiCoreValues, WcsAiValues,
+  AiHttpError, AiAgentCoreValues, AiAgentValues,
   AiRole, AiToolCall, AiTool, AiToolChoice, AiToolCallDelta,
   AiContent, AiContentPart, AiContentTextPart, AiContentImagePart,
 } from "@csbc-dev/ai-agent";
@@ -1255,7 +1255,7 @@ interface AiHttpError {
   retryAfter?: number;   // seconds; populated from the `Retry-After` header when present
 }
 
-interface WcsAiCoreValues {
+interface AiAgentCoreValues {
   content: string;
   messages: AiMessage[];
   usage: AiUsage | null;
@@ -1264,7 +1264,7 @@ interface WcsAiCoreValues {
   error: AiHttpError | Error | null;
 }
 
-interface WcsAiValues extends WcsAiCoreValues {
+interface AiAgentValues extends AiAgentCoreValues {
   trigger: boolean;
 }
 ```
@@ -1457,7 +1457,7 @@ if (last?.role === "assistant" && last.finishReason === "safety") {
 - handler errors and unknown tool names are captured into the tool message payload so the model can recover, instead of rejecting `send()` — only `maxToolRoundtrips` exhaustion and abort surface as terminal errors
 - `registerTool(name, handler)` provides a process-wide registry that `AiCore` consults when `tool.handler` is absent — this is how remote mode resolves handlers after the Shell strips functions from the wire payload
 - `responseSchema` constrains the final response to a JSON object: OpenAI/Azure/Google translate to their native schema fields; Anthropic is emulated via a synthetic forced `tool_use` and unwrapped back into a JSON content string. Forcing non-streaming on Anthropic is intentional — streaming input_json_delta deltas reliably across stateless chunk parsing is out of scope for v1. Mutually exclusive with `tools`.
-- `<ai-message kind="user|assistant">` children seed the initial `messages` history at `connectedCallback` for few-shot templates; `kind="system"` children continue to flow through `_collectSystem()` into `options.system` on each send. Seeding is skipped when `messages` was set programmatically before connect or in remote mode (server-owned state). The legacy `role` attribute is read as a fallback (deprecated since 0.5, removed in 0.6).
+- `<ai-message kind="user|assistant">` children seed the initial `messages` history at `connectedCallback` for few-shot templates; `kind="system"` children continue to flow through `_collectSystem()` into `options.system` on each send. Seeding is skipped when `messages` was set programmatically before connect or in remote mode (server-owned state). The attribute is `kind`, not `role` (which collides with the W3C `HTMLElement.role` ARIA reflection).
 - multimodal input widens `AiMessage.content` from `string` to `string | AiContentPart[]`; only `user` messages carry mixed parts on the wire (assistant/system/tool with array content are flattened to concatenated text). Google (Gemini) accepts only `data:` URLs for images — http(s) URLs throw at `buildRequest` with a clear message, rather than letting the API return a cryptic 400.
 - stored assistant messages carry a normalized `finishReason` (`"stop" | "length" | "tool_use" | "safety" | "other"`) — providers map their native `finish_reason` / `stop_reason` / `finishReason` vocabularies into this union; unknown values collapse to `"other"` so the field stays forward-compatible. Safety refusals reach the consumer through this field, not through `el.error` (see [Error contract §Safety refusals](#safety-refusals-are-not-errors))
 - `AiMessage.providerHints` is a namespaced passthrough for provider-specific wire fields (Anthropic prompt caching via `providerHints.anthropic.cacheControl`; see [Provider details §Provider hints](#provider-hints)). Other providers silently ignore unknown namespaces, so the same history is safe to flow through any provider without per-site shaping

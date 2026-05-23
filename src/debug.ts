@@ -75,16 +75,16 @@ export function warnApiKeyInRemoteMode(): void {
 // Production-visible (console.error) one-time warning when `api-key` is set on
 // a remote-mode <ai-agent> but `forward-credentials` is *not* enabled. The key
 // is silently dropped from the wire payload (the secure default), but a caller
-// upgrading from 0.4.x — where the key was always forwarded — needs a loud
-// signal that their request topology changed. This is intentionally an `error`
-// rather than a `warn` so it shows up in default browser consoles and crash
-// reporters; the alternative (silent breakage) is worse than log noise.
+// who set it clearly expected it to reach the server, so they need a loud
+// signal that it is not. This is intentionally an `error` rather than a `warn`
+// so it shows up in default browser consoles and crash reporters; the
+// alternative (silent breakage) is worse than log noise.
 export function errorApiKeyDroppedInRemoteMode(): void {
   if (typeof console === "undefined" || typeof console.error !== "function") return;
 
   console.error(
     "[@csbc-dev/ai-agent] `api-key` is set on a remote-mode <ai-agent> but `forward-credentials` is not enabled. " +
-    "The key is NOT being sent to the server (this is the secure default since 0.5). " +
+    "The key is NOT being sent to the server (this is the secure default). " +
     "If your server expects the client to relay the key, add `forward-credentials=\"true\"` to the element. " +
     "Otherwise, remove the `api-key` attribute and let the server hold the credentials."
   );
@@ -136,41 +136,19 @@ export function warnAnthropicDefaultMaxTokens(defaultValue: number): void {
   );
 }
 
-// One-shot dev warning when an `<ai-message role="...">` attribute is read,
-// nudging migration to the new `kind` attribute. The `role` attribute collides
-// with the W3C `HTMLElement.role` ARIA reflection (overriding it would
-// silently change the element's accessibility role to "system" / "user" /
-// etc., which are not valid ARIA roles); 0.5 introduces `kind` and 0.6 will
-// remove the `role` fallback. Warns once per page so HMR / repeated reads
-// don't spam the console.
-let _warnedAiMessageRoleAttribute = false;
-export function warnAiMessageRoleAttribute(): void {
-  if (!isDevelopment()) return;
-  if (_warnedAiMessageRoleAttribute) return;
-  if (typeof console === "undefined" || typeof console.warn !== "function") return;
-  _warnedAiMessageRoleAttribute = true;
-
-  console.warn(
-    "[@csbc-dev/ai-agent] <ai-message role=\"...\"> is deprecated since 0.5 and will be removed in 0.6 — " +
-    "rename the attribute to \"kind\" (e.g. <ai-message kind=\"user\">). " +
-    "The \"role\" attribute conflicts with the W3C HTMLElement.role ARIA reflection."
-  );
-}
-
-// Dev-mode warning for an `<ai-message>` whose kind/role value is not in the
+// Dev-mode warning for an `<ai-message>` whose `kind` value is not in the
 // known enum ("system" | "user" | "assistant" | "tool"). A typo silently
 // drops the element from <ai-agent> seeding and the prompt looks "off" with
 // no diagnostic, so we warn once per distinct value seen.
 const _warnedAiMessageUnknownKinds = new Set<string>();
-export function warnAiMessageUnknownKind(value: string, attr: "kind" | "role"): void {
+export function warnAiMessageUnknownKind(value: string): void {
   if (!isDevelopment()) return;
   if (typeof console === "undefined" || typeof console.warn !== "function") return;
-  const key = `${attr}:${value}`;
-  if (_warnedAiMessageUnknownKinds.has(key)) return;
-  _warnedAiMessageUnknownKinds.add(key);
+  if (_warnedAiMessageUnknownKinds.has(value)) return;
+  _warnedAiMessageUnknownKinds.add(value);
 
   console.warn(
-    `[@csbc-dev/ai-agent] <ai-message ${attr}="${value}"> uses an unknown ${attr}. ` +
+    `[@csbc-dev/ai-agent] <ai-message kind="${value}"> uses an unknown kind. ` +
     "Expected one of \"system\", \"user\", \"assistant\", \"tool\". " +
     "The element will be ignored by <ai-agent> seeding."
   );

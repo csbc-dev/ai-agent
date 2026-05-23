@@ -164,11 +164,12 @@ src/
 
 - **Bootstrap**: `bootstrapAi(config?)` / subpaths `@csbc-dev/ai-agent/auto`, `@csbc-dev/ai-agent/auto/remoteEnv`
 - **Core class**: `AiCore` (extends `EventTarget`, supports `target` injection)
-- **Shell class**: `WcsAi` (alias of `Ai`, the implementation behind `<ai-agent>`)
+- **Shell class**: `AiAgent` (alias of `Ai`, the implementation behind `<ai-agent>`)
+- **Element class**: `AiMessageElement` (the implementation behind `<ai-message>`)
 - **Providers**: `OpenAiProvider` / `AnthropicProvider` / `AzureOpenAiProvider` / `GoogleProvider`
 - **Tool registry**: `registerTool` / `unregisterTool` / `getRegisteredTool` / `clearToolRegistry` (process-wide)
-- **Config readers**: `getConfig()` / `getRemoteCoreUrl()`
-- **Types**: `AiMessage` / `AiTool` / `AiToolCall` / `AiContent(*)Part` / `AiHttpError` / `AiUsage` / `AiRequestOptions` / `WcsAiCoreValues` / `WcsAiValues` and more
+- **Config readers**: `getConfig()` / `getRemoteCoreUrl()` / `resetConfig()`
+- **Types**: `AiMessage` / `AiTool` / `AiToolCall` / `AiContent(*)Part` / `AiHttpError` / `AiUsage` / `AiRequestOptions` / `AiAgentCoreValues` / `AiAgentValues` and more
 
 ### Bindable surface
 

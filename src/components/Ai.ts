@@ -486,9 +486,8 @@ export class Ai extends HTMLElement {
     // system属性が優先
     if (this.system) return this.system;
     // First <ai-message> child whose `messageKind` resolves to "system"
-    // (explicit kind="system", legacy role="system", or no attribute at all).
-    // Walked in JS rather than via a CSS selector so the dev-mode deprecation
-    // warning on `role=` and the unknown-kind warning fire from the
+    // (explicit kind="system" or no attribute at all). Walked in JS rather than
+    // via a CSS selector so the dev-mode unknown-kind warning fires from the
     // AiMessageElement getter exactly once per element.
     const tag = config.tagNames.aiMessage;
     const els = Array.from(this.querySelectorAll<AiMessageElement>(tag));
@@ -501,12 +500,12 @@ export class Ai extends HTMLElement {
   }
 
   /**
-   * Seed `_core.messages` from `<ai-message role="user|assistant">` children
+   * Seed `_core.messages` from `<ai-message kind="user|assistant">` children
    * for few-shot prompt templates declared in markup. Runs once at connect
    * time and only when the core's history is still empty so programmatic
    * `el.messages = [...]` before connect wins.
    *
-   * role="system" children are intentionally skipped — they flow through
+   * kind="system" children are intentionally skipped — they flow through
    * `_collectSystem()` into `options.system` on each send, not into the
    * conversation history.
    *
@@ -560,8 +559,8 @@ export class Ai extends HTMLElement {
         //   - Default (forwardCredentials=false): apiKey/baseUrl/apiVersion are
         //     dropped from the payload. The server is the source of truth for
         //     provider credentials (Case B1). If apiKey is set on the element
-        //     in this state, fire a one-time production-visible error so a 0.4→0.5
-        //     upgrader sees that their key is no longer being sent.
+        //     in this state, fire a one-time production-visible error so the
+        //     developer sees that their key is not being sent.
         //   - Opt-in (forwardCredentials=true): credentials are forwarded as
         //     before, with a dev-only nudge that this is only for trusted
         //     transparent-proxy deployments.

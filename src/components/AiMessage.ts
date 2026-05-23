@@ -1,4 +1,4 @@
-import { warnAiMessageRoleAttribute, warnAiMessageUnknownKind } from "../debug.js";
+import { warnAiMessageUnknownKind } from "../debug.js";
 
 const KNOWN_KINDS = new Set(["system", "user", "assistant", "tool"]);
 
@@ -12,13 +12,13 @@ export class AiMessageElement extends HTMLElement {
   }
 
   /**
-   * Conversation role for this message ("system" | "user" | "assistant" | "tool").
+   * Conversation kind for this message — the `AiMessage.role` value
+   * ("system" | "user" | "assistant" | "tool").
    *
-   * Reads the `kind` attribute primarily; falls back to the legacy `role`
-   * attribute (with a one-shot dev warning) for one deprecation cycle. The
-   * `role` attribute collides with the W3C `HTMLElement.role` ARIA reflection,
-   * so 0.5 introduces `kind` as the canonical name and 0.6 will remove the
-   * `role` fallback.
+   * Read from the `kind` attribute; defaults to "system" when absent. `kind` is
+   * used rather than `role` because the latter collides with the W3C
+   * `HTMLElement.role` ARIA reflection — values like "system" / "user" are not
+   * valid ARIA roles and would pollute the accessibility tree.
    *
    * Returns the raw attribute value so consumers (Ai._collectSystem /
    * _seedMessagesFromDom) can ignore unknown kinds without losing the
@@ -27,14 +27,8 @@ export class AiMessageElement extends HTMLElement {
   get messageKind(): string {
     const kindAttr = this.getAttribute("kind");
     if (kindAttr !== null) {
-      if (!KNOWN_KINDS.has(kindAttr)) warnAiMessageUnknownKind(kindAttr, "kind");
+      if (!KNOWN_KINDS.has(kindAttr)) warnAiMessageUnknownKind(kindAttr);
       return kindAttr;
-    }
-    const roleAttr = this.getAttribute("role");
-    if (roleAttr !== null) {
-      warnAiMessageRoleAttribute();
-      if (!KNOWN_KINDS.has(roleAttr)) warnAiMessageUnknownKind(roleAttr, "role");
-      return roleAttr;
     }
     return "system";
   }
