@@ -1,6 +1,6 @@
 {
   "name": "@csbc-dev/ai-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Declarative AI inference component for Web Components. Streaming-first, multi-provider (OpenAI, Anthropic, Azure OpenAI, Google Gemini) via wc-bindable-protocol.",
   "type": "module",
   "main": "dist/index.js",
