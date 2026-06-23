@@ -1,7 +1,7 @@
 import { config, getRemoteCoreUrl } from "../config.js";
 import {
   warnApiKeyInRemoteMode, errorApiKeyDroppedInRemoteMode,
-  warnAiPartnerMissing, warnAiClassUnregistered,
+  warnAiPartnerMissing, warnAiClassUnregistered, remoteLogger,
 } from "../debug.js";
 import type {
   IWcBindable, AiMessage, AiHttpError, AiContentPart, AiTool, AiToolChoice,
@@ -166,7 +166,15 @@ export class Ai extends HTMLElement {
 
   /** @internal — visible for testing */
   private _connectRemote(transport: ClientTransport): void {
-    this._proxy = createRemoteCoreProxy(AiCore.wcBindable, transport);
+    // `logger` routes the proxy's diagnostic warnings (declaration-fingerprint
+    // mismatch on client/server version skew, ignored-sync values, etc.) through
+    // this package's dev-gated channel. `preSyncBehavior` defaults to the
+    // spec-conformant "queue" in @wc-bindable/remote 0.8.0, so pre-sync
+    // setWithAck/invoke calls (e.g. an early `provider` ack or `send()`) are
+    // replayed in order after the first sync rather than racing the wire.
+    this._proxy = createRemoteCoreProxy(AiCore.wcBindable, transport, {
+      logger: remoteLogger,
+    });
 
     // Bridge proxy events to this HTMLElement so framework adapters work
     this._unbind = bind(this._proxy, (name, value) => {

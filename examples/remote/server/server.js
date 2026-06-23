@@ -77,7 +77,19 @@ wss.on("connection", (ws) => {
   core.provider = provider;
 
   const transport = new WebSocketServerTransport(ws);
-  const shell = new RemoteShellProxy(core, transport);
+  // `logger` (a @wc-bindable/remote 0.8.0 option) routes the shell's
+  // diagnostics — dropped set/cmd frames, getter failures, send failures —
+  // through your own sink. A structured logger (pino/winston) slots in here in
+  // production; this example just prefixes console. The server also now emits a
+  // declaration fingerprint on every sync so a client running a mismatched
+  // @csbc-dev/ai-agent version is detected client-side instead of failing per
+  // message — no code change needed for that, it ships with 0.8.0.
+  const shell = new RemoteShellProxy(core, transport, {
+    logger: {
+      warn: (msg, ...rest) => console.warn(`[ai-agent:server] ${msg}`, ...rest),
+      error: (msg, ...rest) => console.error(`[ai-agent:server] ${msg}`, ...rest),
+    },
+  });
 
   ws.on("close", () => {
     core.abort();    // cancel any in-flight inference

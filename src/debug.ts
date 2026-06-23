@@ -13,6 +13,28 @@ function isDevelopment(): boolean {
   return nodeEnv !== "production";
 }
 
+// Diagnostic logger handed to `@wc-bindable/remote`'s RemoteCoreProxy (and the
+// example server's RemoteShellProxy). The remote layer otherwise logs straight
+// to `console.warn` / `console.error`; injecting this adapter (a) attributes
+// those messages to this package via the `[@csbc-dev/ai-agent]` prefix and
+// (b) routes the proxy's diagnostic `warn`s — declaration-fingerprint mismatch
+// (client/server version skew), ignored-sync values, unknown response ids —
+// through the same `isDevelopment()` gate as the rest of this module so they
+// stay silent in production. `error` is never gated: the contract allows the
+// remote layer to escalate to `error`, and a genuine error should always
+// surface (matching `errorApiKeyDroppedInRemoteMode`).
+export const remoteLogger = {
+  warn(message: string, ...extras: unknown[]): void {
+    if (!isDevelopment()) return;
+    if (typeof console === "undefined" || typeof console.warn !== "function") return;
+    console.warn(`[@csbc-dev/ai-agent] ${message}`, ...extras);
+  },
+  error(message: string, ...extras: unknown[]): void {
+    if (typeof console === "undefined" || typeof console.error !== "function") return;
+    console.error(`[@csbc-dev/ai-agent] ${message}`, ...extras);
+  },
+};
+
 export function warnStreamParseFailure(
   provider: string,
   event: string | undefined,

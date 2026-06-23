@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@csbc-dev/ai-agent": "file:../../..",
-    "@wc-bindable/core": "^0.4.0"
+    "@wc-bindable/core": "^0.8.0"
   },
   "devDependencies": {
     "vite": "^7.0.0"

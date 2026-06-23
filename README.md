@@ -1059,6 +1059,18 @@ wss.on("connection", (ws) => {
 
 Point the browser at `wss://<host>:8080/ai-agent` via `remoteCoreUrl`. Instantiate `AiCore` **per connection** — `AiCore` owns conversation history, in-flight `AbortController`, and streaming state, and must not be shared across sessions.
 
+> **`@wc-bindable/remote` ≥ 0.8.0.** This package depends on `@wc-bindable/remote ^0.8.0`; the server you wire up should resolve the same major. Three behaviors come for free with no code change:
+> - **Declaration fingerprint.** The server emits a structural fingerprint of `AiCore.wcBindable` on every sync, and the client compares it to its own. A client running a mismatched `@csbc-dev/ai-agent` version is detected up front (the client logs a warning) instead of failing per message.
+> - **Capabilities negotiation** (`setAck` / `undefinedProperties` / `getterFailures`) and a **spec-conformant pre-sync queue** (`setWithAck` / `invoke` issued before the first sync are replayed in caller order rather than racing the wire).
+>
+> Both `RemoteShellProxy` (server) and `RemoteCoreProxy` (client, inside `<ai-agent>`) accept an optional `logger` so the layer's diagnostics route through your own sink — `<ai-agent>` already wires one that respects this package's dev-mode gate. On the server, pass a structured logger and optionally bound memory against slow peers:
+>
+> ```ts
+> const shell = new RemoteShellProxy(core, transport, {
+>   logger: { warn: (m, ...x) => log.warn(m, ...x), error: (m, ...x) => log.error(m, ...x) },
+> });
+> ```
+
 ##### Pooling and reuse on edge runtimes
 
 On platforms where cold start on `new AiCore()` is a real cost (CF Workers, Vercel Edge, Lambda at low concurrency), a pool of pre-warmed Cores is sometimes attractive. `AiCore` is not a thread-safe pool entry, but its *per-request* state can be reset to pool-entry condition between requests:

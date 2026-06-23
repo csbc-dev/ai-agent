@@ -52,7 +52,14 @@ export interface IWcBindableCommand {
 
 export interface IWcBindable {
   readonly protocol: "wc-bindable";
-  readonly version: 1;
+  /**
+   * Integer protocol version. Typed as `number` (not the literal `1`) to mirror
+   * `@wc-bindable/core`'s `WcBindableDeclaration` and the protocol's
+   * forward-compatibility policy: an adapter built for version N MUST accept
+   * declarations whose `version` is >= N. AiCore/Ai still emit `1`; widening the
+   * type only keeps this declaration assignable as the protocol evolves.
+   */
+  readonly version: number;
   readonly properties: IWcBindableProperty[];
   readonly inputs?: IWcBindableInput[];
   readonly commands?: IWcBindableCommand[];

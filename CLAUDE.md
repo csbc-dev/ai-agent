@@ -193,6 +193,8 @@ The Shell (`Ai.wcBindable`) adds a `trigger` property (`ai-agent:trigger-changed
 
 `RemoteShellProxy` (server) / `RemoteCoreProxy` (client) from `@wc-bindable/remote` push the Core onto the server. The client-side `<ai-agent>` is unchanged; tool handlers registered via `registerTool()` on the server are invoked by the Core there, so API keys and authorization logic never reach the browser. Setting `remote.remoteSettingType` to `"env"` resolves the WebSocket URL from `process.env.AI_REMOTE_CORE_URL` or `globalThis.AI_REMOTE_CORE_URL`.
 
+The package pins `@wc-bindable/remote ^0.8.0`, which adds (transparently, no code change) a **declaration fingerprint** on every sync — the client compares the server's `AiCore.wcBindable` surface to its own and warns on version skew before it surfaces as a per-message rejection — plus capabilities negotiation and a spec-conformant pre-sync call queue. `<ai-agent>` injects a dev-gated `logger` (`remoteLogger` in [src/debug.ts](src/debug.ts)) into `createRemoteCoreProxy` so these remote-layer diagnostics carry the package prefix and respect the same `isDevelopment()` gate as the rest of the warnings. The protocol identifier is still `wc-bindable` v1; the `version` field in [src/types.ts](src/types.ts) is typed `number` (not the literal `1`) to match the protocol's forward-compatibility policy.
+
 ### Configuration (`config.ts`)
 
 | Key | Default | Purpose |
