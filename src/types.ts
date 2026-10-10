@@ -8,16 +8,33 @@ export interface IWritableTagNames {
   aiMessage?: string;
 }
 
+/**
+ * How `<ai-agent>`'s `RemoteCoreProxy` treats `setWithAck` / `invoke` calls
+ * issued before the server's first `sync` response (an early `provider` ack,
+ * `el.messages = [...]`, `send()`, `abort()` right after connecting).
+ *
+ * - `"queue"` (default): held until the sync response has been processed,
+ *   then sent in call order — SPEC-extensions.md § Pre-sync call state
+ *   machine (MUST).
+ * - `"eager"`: written to the socket immediately (the `@wc-bindable/remote`
+ *   library default through 0.10, documented upstream as non-conformant).
+ *   Legacy escape hatch only; see README § Calls made before the initial
+ *   sync for what it gives up.
+ */
+export type AiPreSyncBehavior = "queue" | "eager";
+
 export interface IRemoteConfig {
   readonly enableRemote: boolean;
   readonly remoteSettingType: "env" | "config";
   readonly remoteCoreUrl: string;
+  readonly preSyncBehavior: AiPreSyncBehavior;
 }
 
 export interface IWritableRemoteConfig {
   enableRemote?: boolean;
   remoteSettingType?: "env" | "config";
   remoteCoreUrl?: string;
+  preSyncBehavior?: AiPreSyncBehavior;
 }
 
 export interface IConfig {

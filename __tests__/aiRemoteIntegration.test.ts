@@ -17,7 +17,9 @@ import type {
 import { RemoteShellProxy } from "@wc-bindable/remote";
 import { Ai } from "../src/components/Ai";
 import { AiCore } from "../src/core/AiCore";
+import { OpenAiProvider } from "../src/providers/OpenAiProvider";
 import { registerComponents } from "../src/registerComponents";
+import { setConfig, resetConfig } from "../src/config";
 
 registerComponents();
 
@@ -33,7 +35,9 @@ registerComponents();
  * hide wire-shape regressions. `clientSent` records the decoded client →
  * server frames so tests can assert what actually crossed the wire.
  */
-function createMockTransportPair(): {
+function createMockTransportPair(options: {
+  rewriteServerMessage?: (msg: ServerMessage) => ServerMessage | null;
+} = {}): {
   client: ClientTransport;
   server: ServerTransport;
   clientSent: ClientMessage[];
@@ -54,8 +58,13 @@ function createMockTransportPair(): {
 
   const server: ServerTransport = {
     send: (msg) => {
-      const decoded = wire(msg);
-      if (clientHandler) Promise.resolve().then(() => clientHandler!(decoded));
+      // `rewriteServerMessage` stands in for a different producer (another
+      // protocol version, a legacy server) or a server that never answers
+      // `sync` (return null to drop the frame).
+      const decoded = options.rewriteServerMessage
+        ? options.rewriteServerMessage(wire(msg))
+        : wire(msg);
+      if (decoded && clientHandler) Promise.resolve().then(() => clientHandler!(decoded));
     },
     onMessage: (handler) => { serverHandler = handler; },
   };
@@ -126,7 +135,10 @@ function streamResponse(chunks: string[], status = 200): Response {
  * logger output — a non-JsonValue property value is reported there as a
  * dropped update / dropped sync value.
  */
-function createRemoteAi(options: { deferConnect?: boolean } = {}): {
+function createRemoteAi(options: {
+  deferConnect?: boolean;
+  rewriteServerMessage?: (msg: ServerMessage) => ServerMessage | null;
+} = {}): {
   el: Ai;
   core: AiCore;
   shell: RemoteShellProxy;
@@ -136,7 +148,9 @@ function createRemoteAi(options: { deferConnect?: boolean } = {}): {
   cleanup: () => void;
 } {
   const core = new AiCore();
-  const { client, server, clientSent } = createMockTransportPair();
+  const { client, server, clientSent } = createMockTransportPair({
+    rewriteServerMessage: options.rewriteServerMessage,
+  });
   const shellWarnings: string[] = [];
   const shell = new RemoteShellProxy(core, server, {
     logger: {
@@ -743,6 +757,76 @@ describe("Remote integration", () => {
       });
     });
 
+    describe("status/statusTextを持つ非Errorの例外がリモートでel.errorに届く", () => {
+      class UpstreamHttpError {
+        status = 429;
+        statusText = "Too Many Requests";
+        body = "slow down";
+        retryAfter = 7;
+        headers = new Map([["retry-after", "7"]]);
+      }
+      const cases: Array<{ label: string; thrown: () => unknown; expected: Record<string, unknown> }> = [
+        {
+          label: "Responseオブジェクト",
+          thrown: () => new Response("upstream down", { status: 503, statusText: "Service Unavailable" }),
+          expected: { status: 503, statusText: "Service Unavailable", body: "" },
+        },
+        {
+          label: "Errorを継承しないHTTPエラークラス",
+          thrown: () => new UpstreamHttpError(),
+          expected: { status: 429, statusText: "Too Many Requests", body: "slow down", retryAfter: 7 },
+        },
+        {
+          label: "undefinedキー入りのplain object",
+          thrown: () => ({ status: 500, statusText: "Internal Server Error", body: "oops", retryAfter: undefined }),
+          expected: { status: 500, statusText: "Internal Server Error", body: "oops" },
+        },
+      ];
+
+      for (const { label, thrown, expected } of cases) {
+        it(`update経路: ${label}`, async () => {
+          fetchSpy.mockRejectedValueOnce(thrown());
+
+          const { el, core, shellWarnings, cleanup } = createRemoteAi();
+          document.body.appendChild(el);
+          await settle();
+
+          core.provider = "openai";
+          el.setAttribute("model", "gpt-4o");
+          el.stream = false;
+          el.prompt = "Hi";
+
+          await expect(el.send()).resolves.toBeNull();
+          await settle();
+
+          expect(el.error).not.toBeInstanceOf(Error);
+          expect(el.error).toStrictEqual(expected);
+          expect(el.loading).toBe(false);
+          expect(el.messages).toEqual([]);
+          noDroppedValues(shellWarnings);
+
+          cleanup();
+        });
+
+        it(`sync経路: ${label}`, async () => {
+          fetchSpy.mockRejectedValueOnce(thrown());
+
+          const { el, core, shellWarnings, connect, cleanup } = createRemoteAi({ deferConnect: true });
+          core.provider = "openai";
+          await core.send("Hi", { model: "gpt-4o", stream: false });
+
+          connect();
+          document.body.appendChild(el);
+          await settle();
+
+          expect(el.error).toStrictEqual(expected);
+          noDroppedValues(shellWarnings);
+
+          cleanup();
+        });
+      }
+    });
+
     describe("undefined値の任意フィールド（A3）", () => {
       it("messagesセッターの明示的undefinedフィールドは省いて送られ、サーバーに反映される", async () => {
         const { el, core, clientSent, cleanup } = createRemoteAi();
@@ -872,6 +956,262 @@ describe("Remote integration", () => {
         noDroppedValues(late.shellWarnings);
         late.cleanup();
       });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Calls issued before the initial sync response (pre-sync)
+  // -----------------------------------------------------------------------
+  // SPEC-extensions.md § Pre-sync call state machine: setWithAck / invoke
+  // issued before the first sync response MUST be queued and replayed in
+  // caller order once that response has been processed. `<ai-agent>` issues
+  // such calls whenever it is used right after connecting: a `provider`
+  // attribute ack, `el.messages = [...]`, `send()`, `abort()`.
+  describe("sync応答前の操作（pre-sync queue）", () => {
+    const wireKinds = (sent: ClientMessage[]): string[] =>
+      sent.map(m => (m.type === "sync" ? "sync" : `${m.type}:${m.name}`));
+
+    function hangingFetchUntilAbort(): void {
+      fetchSpy.mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+        (init as RequestInit).signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      }));
+    }
+
+    it("接続直後のprovider / messages / sendはsync応答の処理後に呼び出し順で送られ、結果が一貫する", async () => {
+      fetchSpy.mockResolvedValueOnce(jsonResponse({
+        choices: [{ message: { content: "Answer" } }],
+      }));
+
+      const { el, core, clientSent, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      // Everything below runs before the sync response can arrive.
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.messages = [
+        { role: "user", content: "Earlier question" },
+        { role: "assistant", content: "Earlier answer" },
+      ];
+      el.prompt = "Follow-up";
+      const result = el.send();
+
+      // Nothing but the proxy's own sync request is on the wire yet.
+      expect(wireKinds(clientSent)).toEqual(["sync"]);
+
+      await expect(result).resolves.toBe("Answer");
+      await settle();
+
+      expect(wireKinds(clientSent)).toEqual(["sync", "set:provider", "set:messages", "cmd:send"]);
+      // The send ran on a Core that already had the provider and the history.
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages).toEqual([
+        { role: "user", content: "Earlier question" },
+        { role: "assistant", content: "Earlier answer" },
+        { role: "user", content: "Follow-up" },
+      ]);
+      const expected = [
+        { role: "user", content: "Earlier question" },
+        { role: "assistant", content: "Earlier answer" },
+        { role: "user", content: "Follow-up" },
+        { role: "assistant", content: "Answer" },
+      ];
+      expect(el.messages).toEqual(expected);
+      expect(core.messages).toEqual(expected);
+      expect(el.content).toBe("Answer");
+      expect(el.loading).toBe(false);
+      expect(el.error).toBeNull();
+
+      cleanup();
+    });
+
+    it("sync応答前に要素が外されたら、sendもabortもサーバーに届かずLLMへのリクエストは発行されない", async () => {
+      hangingFetchUntilAbort();
+
+      const { el, core, clientSent, cleanup } = createRemoteAi();
+      core.provider = "openai"; // the server decides the provider
+      document.body.appendChild(el);
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+      const result = el.send();
+      el.remove(); // e.g. an SPA route change right after triggering a send
+
+      await expect(result).resolves.toBeNull();
+      await settle();
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(wireKinds(clientSent)).toEqual(["sync"]);
+      expect(core.messages).toEqual([]);
+      expect((el.error as { code?: string } | null)?.code).toBe("WC_BINDABLE_DISPOSED");
+      expect(el.loading).toBe(false);
+
+      cleanup();
+    });
+
+    it("サーバーのdeclaration protocolが異なる場合、sync前に出したmessages / sendはサーバーで実行されない", async () => {
+      fetchSpy.mockResolvedValue(jsonResponse({
+        choices: [{ message: { content: "must not run" } }],
+      }));
+
+      const { el, core, clientSent, cleanup } = createRemoteAi({
+        rewriteServerMessage: (msg) => (msg.type === "sync" && msg.declarationFingerprint
+          ? { ...msg, declarationFingerprint: { ...msg.declarationFingerprint, protocol: "wc-bindable-2" } }
+          : msg),
+      });
+      core.provider = "openai";
+      document.body.appendChild(el);
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.messages = [
+        { role: "user", content: "Earlier question" },
+        { role: "assistant", content: "Earlier answer" },
+      ];
+      el.prompt = "Hi";
+
+      const error = await el.send().then(() => null, (e: unknown) => e);
+      await settle();
+
+      expect((error as { code?: string } | null)?.code).toBe("WC_BINDABLE_PROTOCOL_ERROR");
+      expect((el.error as { code?: string } | null)?.code).toBe("WC_BINDABLE_PROTOCOL_ERROR");
+      // The client reported failure, so the server must not have acted.
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(core.messages).toEqual([]);
+      expect(wireKinds(clientSent)).toEqual(["sync"]);
+
+      cleanup();
+    });
+
+    it("setAckを広告しないサーバーには、sync前のprovider変更を送らずWC_BINDABLE_SET_ACK_UNSUPPORTEDで拒否する", async () => {
+      const { el, core, clientSent, cleanup } = createRemoteAi({
+        rewriteServerMessage: (msg) => (msg.type === "sync"
+          ? { ...msg, capabilities: { ...msg.capabilities, setAck: false } }
+          : msg),
+      });
+      core.provider = "openai";
+      document.body.appendChild(el);
+      el.setAttribute("provider", "anthropic");
+      await settle();
+
+      // No id-bearing set reached a server that cannot acknowledge it
+      // (CONFORMANCE.md vector 10), so the server's provider is what the
+      // client says it is: unchanged.
+      expect(clientSent.some(m => m.type === "set")).toBe(false);
+      expect(core.provider).toBeInstanceOf(OpenAiProvider);
+      expect((el.error as { code?: string } | null)?.code).toBe("WC_BINDABLE_SET_ACK_UNSUPPORTED");
+
+      // send() refuses instead of running on the server's previous provider.
+      el.setAttribute("model", "claude-sonnet-4-20250514");
+      el.prompt = "Hi";
+      await expect(el.send()).rejects.toMatchObject({ code: "WC_BINDABLE_SET_ACK_UNSUPPORTED" });
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      cleanup();
+    });
+
+    it("sync応答前のsend → abortは呼び出し順のまま送られ、サーバー側の推論が中断される", async () => {
+      hangingFetchUntilAbort();
+
+      const { el, core, clientSent, cleanup } = createRemoteAi();
+      core.provider = "openai";
+      document.body.appendChild(el);
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+      const result = el.send();
+      el.abort();
+
+      await expect(result).resolves.toBeNull();
+      await settle();
+
+      expect(wireKinds(clientSent)).toEqual(["sync", "cmd:send", "cmd:abort"]);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(el.loading).toBe(false);
+      expect(el.messages).toEqual([]);
+      expect(core.messages).toEqual([]);
+      expect(el.error).toBeNull();
+
+      cleanup();
+    });
+
+    it("サーバーが応答しない間、send（timeoutMs: 0）は保留され続け、要素を外すとWC_BINDABLE_DISPOSEDでnullに決着する", async () => {
+      fetchSpy.mockImplementation(() => new Promise<Response>(() => {}));
+
+      const { el, shell, cleanup } = createRemoteAi();
+      shell.dispose(); // the server never answers anything, sync included
+      document.body.appendChild(el);
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+      let settled = false;
+      const result = el.send().finally(() => { settled = true; });
+
+      await settle();
+      expect(settled).toBe(false);
+
+      el.remove();
+      await expect(result).resolves.toBeNull();
+      expect((el.error as { code?: string } | null)?.code).toBe("WC_BINDABLE_DISPOSED");
+      expect(el.loading).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      cleanup();
+    });
+
+    it("サーバーが応答しないまま既定の30秒が過ぎると、providerのackはTimeoutErrorになりsendは拒否される", async () => {
+      vi.useFakeTimers();
+      try {
+        const { el, shell, cleanup } = createRemoteAi();
+        shell.dispose();
+        document.body.appendChild(el);
+        el.setAttribute("provider", "openai");
+
+        await vi.advanceTimersByTimeAsync(29_000);
+        expect(el.error).toBeNull();
+
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(el.error).toBeInstanceOf(Error);
+        expect(el.error).toMatchObject({ name: "TimeoutError" });
+        el.setAttribute("model", "gpt-4o");
+        el.prompt = "Hi";
+        await expect(el.send()).rejects.toMatchObject({ name: "TimeoutError" });
+
+        cleanup();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("config.remote.preSyncBehavior: \"eager\" で従来の即時送信に戻せる（互換サーバーなら結果は同じ）", async () => {
+      setConfig({ remote: { preSyncBehavior: "eager" } });
+      try {
+        fetchSpy.mockResolvedValueOnce(jsonResponse({
+          choices: [{ message: { content: "Answer" } }],
+        }));
+
+        const { el, core, clientSent, cleanup } = createRemoteAi();
+        document.body.appendChild(el);
+        el.setAttribute("provider", "openai");
+        el.setAttribute("model", "gpt-4o");
+        el.stream = false;
+        el.prompt = "Hi";
+        const result = el.send();
+
+        // Written immediately, behind the proxy's own sync request.
+        expect(wireKinds(clientSent)).toEqual(["sync", "set:provider"]);
+
+        await expect(result).resolves.toBe("Answer");
+        await settle();
+        expect(wireKinds(clientSent)).toEqual(["sync", "set:provider", "cmd:send"]);
+        expect(core.messages).toEqual([
+          { role: "user", content: "Hi" },
+          { role: "assistant", content: "Answer" },
+        ]);
+        expect(el.messages).toEqual(core.messages);
+        expect(el.error).toBeNull();
+
+        cleanup();
+      } finally {
+        resetConfig();
+      }
     });
   });
 });
