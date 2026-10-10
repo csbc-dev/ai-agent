@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ai-agent element E2E Test</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "@wc-bindable/core": "/packages/core/dist/index.js",
+        "@wc-bindable/remote": "/packages/remote/dist/index.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="status">loading</div>
+
+  <script type="module">
+    import { bootstrapAi } from "/packages/ai/dist/index.js";
+
+    bootstrapAi({
+      autoTrigger: false,
+      remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: `ws://${location.host}` },
+    });
+
+    // Helpers that ai-remote.spec.ts drives through page.evaluate().
+    window.e2e = {
+      /**
+       * A remote <ai-agent> (not yet attached) whose server-side inference
+       * calls /api/ai/slow, which stays pending until it is aborted.
+       */
+      createAgent(attrs = {}) {
+        const el = document.createElement("ai-agent");
+        el.setAttribute("model", "gpt-4o");
+        el.setAttribute("no-stream", "");
+        el.setAttribute("forward-credentials", "true");
+        el.setAttribute("base-url", `${location.origin}/api/ai/slow`);
+        for (const [name, value] of Object.entries(attrs)) el.setAttribute(name, value);
+        el.prompt = "Hi";
+        return el;
+      },
+      /** Resolves with the detail of the next `type` event that `accept` accepts. */
+      nextEvent(el, type, accept = () => true) {
+        return new Promise((resolve) => {
+          el.addEventListener(type, function onEvent(e) {
+            if (!accept(e.detail)) return;
+            el.removeEventListener(type, onEvent);
+            resolve(e.detail);
+          });
+        });
+      },
+      /** A send() outcome as JSON: { value } or { error: { name, message, code } }. */
+      outcome(promise) {
+        return promise.then(
+          (value) => ({ value }),
+          (e) => ({ error: { name: e.name, message: e.message, code: e.code } }),
+        );
+      },
+    };
+
+    document.getElementById("status").textContent = "ready";
+  </script>
+</body>
+</html>

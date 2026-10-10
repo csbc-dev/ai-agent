@@ -1053,6 +1053,43 @@ describe("Ai (ai-agent)", () => {
       // abortSpyは内部なので、間接的に確認
       expect(() => el.remove()).not.toThrow();
     });
+
+    // Local counterpart of the remote removal tests (aiRemoteIntegration):
+    // the same send() result and loading reset; `error` differs on purpose —
+    // locally the removal is an abort() of a Core the element keeps, so its
+    // outcome is known, while a remote removal loses the connection
+    // (WC_BINDABLE_DISPOSED, a transport failure).
+    it("送信中に要素を外すとabort()と同じくsendはnullに決着し、loadingはfalseに戻り、errorは立たない", async () => {
+      fetchSpy.mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+        (init as RequestInit).signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+      el.prompt = "Hi";
+      const errors: unknown[] = [];
+      const loading: boolean[] = [];
+      el.addEventListener("ai-agent:error", e => errors.push((e as CustomEvent).detail));
+      el.addEventListener("ai-agent:loading-changed", e => loading.push((e as CustomEvent).detail));
+
+      const result = el.send();
+      await Promise.resolve();
+      expect(el.loading).toBe(true);
+      el.remove();
+
+      await expect(result).resolves.toBeNull();
+      expect(el.loading).toBe(false);
+      expect(el.streaming).toBe(false);
+      expect(loading.at(-1)).toBe(false);
+      expect(el.error).toBeNull();
+      expect(errors.filter(e => e !== null)).toEqual([]);
+      expect(el.messages).toEqual([]);
+    });
   });
 
   describe("internal helpers", () => {

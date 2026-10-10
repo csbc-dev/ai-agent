@@ -117,3 +117,69 @@ test("bind() updates include loading transitions", async ({ page }) => {
   expect(contentValues.length).toBeGreaterThan(0);
   expect(contentValues).toContain("Echo: Hello");
 });
+
+// <ai-agent> itself (the built dist) over a real WebSocket: removing the
+// element settles a pending send() as a transport failure whether the call
+// still waits for the `provider` ack or already runs on the server.
+test.describe("<ai-agent> removed during a remote send()", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto(`http://localhost:${server.port}/element.html`);
+    await expect(page.locator("#status")).toHaveText("ready");
+  });
+
+  test("while send() waits for the provider ack: resolves null with WC_BINDABLE_DISPOSED", async ({ page }) => {
+    const r = await page.evaluate(async () => {
+      const { createAgent, nextEvent, outcome } = (window as any).e2e;
+      const el = createAgent();
+      const synced = nextEvent(el, "ai-agent:messages-changed");
+      document.body.append(el);
+      await synced;
+      el.setAttribute("provider", "openai"); // its ack is now in flight
+      const result = outcome(el.send());
+      el.remove();
+      return { result: await result, errorCode: el.error?.code, loading: el.loading };
+    });
+
+    expect(r).toEqual({ result: { value: null }, errorCode: "WC_BINDABLE_DISPOSED", loading: false });
+  });
+
+  test("after send() was invoked: the same outcome, and loading=false reaches listeners", async ({ page }) => {
+    const r = await page.evaluate(async () => {
+      const { createAgent, nextEvent, outcome } = (window as any).e2e;
+      const el = createAgent({ provider: "openai" });
+      const loading: boolean[] = [];
+      el.addEventListener("ai-agent:loading-changed", (e: CustomEvent) => loading.push(e.detail));
+      const running = nextEvent(el, "ai-agent:loading-changed", (busy: boolean) => busy === true);
+      document.body.append(el);
+      const result = outcome(el.send());
+      await running; // the server-side inference is under way
+      el.remove();
+      return { result: await result, errorCode: el.error?.code, loading: el.loading, lastLoadingEvent: loading.at(-1) };
+    });
+
+    expect(r).toEqual({
+      result: { value: null },
+      errorCode: "WC_BINDABLE_DISPOSED",
+      loading: false,
+      lastLoadingEvent: false,
+    });
+  });
+
+  test("a provider the server refuses still makes send() reject", async ({ page }) => {
+    const r = await page.evaluate(async () => {
+      const { createAgent, nextEvent, outcome } = (window as any).e2e;
+      const el = createAgent();
+      const synced = nextEvent(el, "ai-agent:messages-changed");
+      document.body.append(el);
+      await synced;
+      el.setAttribute("provider", "no-such-provider");
+      const result = await outcome(el.send());
+      const errorMessage = el.error?.message;
+      el.remove();
+      return { result, errorMessage };
+    });
+
+    expect(r.result.error.message).toContain('Unknown provider: "no-such-provider"');
+    expect(r.errorMessage).toContain('Unknown provider: "no-such-provider"');
+  });
+});

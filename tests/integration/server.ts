@@ -97,6 +97,19 @@ export function startServer(port: number): Promise<{
         return;
       }
 
+      // Route: /api/ai/slow* — holds the request open (an inference that is
+      // still running) until the caller aborts it. Answers after 5 s anyway so
+      // a request nobody aborts cannot keep the server from closing.
+      if (url.startsWith("/api/ai/slow")) {
+        req.resume();
+        const timer = setTimeout(() => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(buildNonStreamResponse("slow"));
+        }, 5000);
+        res.on("close", () => clearTimeout(timer));
+        return;
+      }
+
       // Route: /api/ai/* — mock OpenAI-compatible API
       if (url.startsWith("/api/ai")) {
         let body = "";
@@ -129,6 +142,14 @@ export function startServer(port: number): Promise<{
       // Route: /client.html
       if (url === "/" || url === "/client.html") {
         const file = path.join(integrationDir, "client.html");
+        res.writeHead(200, { "Content-Type": "text/html" });
+        fs.createReadStream(file).pipe(res);
+        return;
+      }
+
+      // Route: /element.html — <ai-agent> itself (built dist) in remote mode
+      if (url === "/element.html") {
+        const file = path.join(integrationDir, "element.html");
         res.writeHead(200, { "Content-Type": "text/html" });
         fs.createReadStream(file).pipe(res);
         return;

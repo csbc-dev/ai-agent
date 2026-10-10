@@ -1162,23 +1162,64 @@ describe("Remote integration", () => {
       cleanup();
     });
 
-    it("サーバーが応答しないまま既定の30秒が過ぎると、providerのackはTimeoutErrorになりsendは拒否される", async () => {
+    it("サーバーが応答しないまま既定の30秒が過ぎると、providerのackはTimeoutErrorになり、sendは送られずtransport failureとしてnullに決着する", async () => {
+      vi.useFakeTimers();
+      try {
+        const { el, shell, clientSent, cleanup } = createRemoteAi();
+        shell.dispose();
+        document.body.appendChild(el);
+        el.setAttribute("provider", "openai");
+        el.setAttribute("model", "gpt-4o");
+        el.prompt = "Hi";
+        let settled = false;
+        const waiting = el.send().finally(() => { settled = true; }); // waits for the provider ack
+
+        await vi.advanceTimersByTimeAsync(29_000);
+        expect(el.error).toBeNull();
+        expect(settled).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(el.error).toBeInstanceOf(Error);
+        expect(el.error).toMatchObject({ name: "TimeoutError" });
+        // A timeout is a transport failure (_isTransportError), as for an
+        // invoke: resolves null, the failure stays in `error`.
+        await expect(waiting).resolves.toBeNull();
+        // The provider change was never confirmed, so later calls still refuse
+        // to run on the server's previous provider — the same way.
+        await expect(el.send()).resolves.toBeNull();
+        expect(el.error).toMatchObject({ name: "TimeoutError" });
+        expect(clientSent.some(m => m.type === "cmd" && m.name === "send")).toBe(false);
+
+        cleanup();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("providerのackのTimeoutErrorが別のエラーでel.errorから上書きされていれば、それで送れないsendはproviderのエラーをel.errorに戻す", async () => {
       vi.useFakeTimers();
       try {
         const { el, shell, cleanup } = createRemoteAi();
         shell.dispose();
         document.body.appendChild(el);
         el.setAttribute("provider", "openai");
+        await vi.advanceTimersByTimeAsync(30_000);
+        const providerTimeout = el.error;
+        expect(providerTimeout).toMatchObject({ name: "TimeoutError" });
 
-        await vi.advanceTimersByTimeAsync(29_000);
-        expect(el.error).toBeNull();
-
-        await vi.advanceTimersByTimeAsync(1_000);
-        expect(el.error).toBeInstanceOf(Error);
+        el.messages = [{ role: "user", content: "Earlier" }];
+        await vi.advanceTimersByTimeAsync(30_000);
         expect(el.error).toMatchObject({ name: "TimeoutError" });
+        expect(el.error).not.toBe(providerTimeout); // the messages ack's own timeout
+
+        const errors: unknown[] = [];
+        el.addEventListener("ai-agent:error", e => errors.push((e as CustomEvent).detail));
         el.setAttribute("model", "gpt-4o");
         el.prompt = "Hi";
-        await expect(el.send()).rejects.toMatchObject({ name: "TimeoutError" });
+        await expect(el.send()).resolves.toBeNull();
+        // `error` names what kept this call from being sent.
+        expect(el.error).toBe(providerTimeout);
+        expect(errors).toEqual([providerTimeout]);
 
         cleanup();
       } finally {
@@ -1386,6 +1427,279 @@ describe("Remote integration", () => {
 
       cleanup();
     });
+  });
+
+  // -----------------------------------------------------------------------
+  // Element removed while send() still waits for the `provider` ack
+  // -----------------------------------------------------------------------
+  // Removing the element disposes the proxy. A send() already invoked then
+  // settles as a transport failure (WC_BINDABLE_DISPOSED: resolves null,
+  // `error` set, loading reset). One still waiting for the `provider` ack
+  // used to reject instead: the ack's DISPOSED rejection was taken for a
+  // failed provider change.
+  describe("providerのack待ち中の要素削除", () => {
+    const outcome = (p: Promise<string | null>) =>
+      p.then(value => ({ value }), (error: unknown) => ({ error }));
+    const codeOf = (e: unknown) => (e as { code?: string } | null)?.code;
+    const sendCmds = (sent: ClientMessage[]) =>
+      sent.filter(m => m.type === "cmd" && m.name === "send");
+
+    function answerFetch(content: string): void {
+      fetchSpy.mockResolvedValue(jsonResponse({ choices: [{ message: { content } }] }));
+    }
+
+    /** Re-attach `el` to a fresh server, as connectedCallback does after a removal. */
+    function attachToNewServer(el: Ai): { core: AiCore; clientSent: ClientMessage[]; cleanup: () => void } {
+      const core = new AiCore();
+      const { client, server, clientSent } = createMockTransportPair();
+      const shell = new RemoteShellProxy(core, server);
+      (el as any)._connectRemote(client);
+      document.body.appendChild(el);
+      return { core, clientSent, cleanup: () => { shell.dispose(); el.remove(); } };
+    }
+
+    /**
+     * `errors` collects the failures reported through `ai-agent:error` (the
+     * `null`s a server sync dispatches — e.g. when its send() starts — are
+     * left out).
+     */
+    function recordEvents(el: Ai): { errors: unknown[]; loading: boolean[] } {
+      const errors: unknown[] = [];
+      const loading: boolean[] = [];
+      el.addEventListener("ai-agent:error", (e) => {
+        const detail = (e as CustomEvent).detail;
+        if (detail !== null) errors.push(detail);
+      });
+      el.addEventListener("ai-agent:loading-changed", e => loading.push((e as CustomEvent).detail));
+      return { errors, loading };
+    }
+
+    const timings = ["ack待ち・sync前", "ack待ち・sync後", "invoke後"] as const;
+    for (const timing of timings) {
+      it(`${timing}に要素を外すと、sendはWC_BINDABLE_DISPOSEDのtransport failureとしてnullに決着する`, async () => {
+        hangingFetchUntilAbort();
+
+        const { el, core, clientSent, cleanup } = createRemoteAi();
+        document.body.appendChild(el);
+        if (timing !== "ack待ち・sync前") await settle();
+        el.setAttribute("provider", "openai");
+        el.setAttribute("model", "gpt-4o");
+        el.stream = false;
+        el.prompt = "Hi";
+        if (timing === "invoke後") await settle(); // ack received: send() invokes at once
+        const events = recordEvents(el);
+        const result = outcome(el.send());
+        if (timing === "invoke後") {
+          await settle();
+          expect(el.loading).toBe(true);
+        }
+
+        el.remove();
+
+        expect(await result).toEqual({ value: null });
+        expect(codeOf(el.error)).toBe("WC_BINDABLE_DISPOSED");
+        // Reported once, by the send() — the same Error el.error holds.
+        expect(events.errors).toHaveLength(1);
+        expect(events.errors[0]).toBe(el.error);
+        expect(el.loading).toBe(false);
+        expect(el.streaming).toBe(false);
+        if (timing === "invoke後") {
+          // The reset reaches bind() consumers too, not only the getter.
+          expect(events.loading.at(-1)).toBe(false);
+          await settle();
+          expect(fetchSpy).toHaveBeenCalledTimes(1);
+          expect(core.loading).toBe(false); // the removal's abort reached the server
+        } else {
+          await settle();
+          expect(sendCmds(clientSent)).toEqual([]);
+          expect(fetchSpy).not.toHaveBeenCalled();
+          expect(core.messages).toEqual([]);
+        }
+
+        cleanup();
+      });
+    }
+
+    it("要素を移動（外して直ちに付け直す）しても、ack待ちのsendは元の接続のDISPOSEDで決着し、新しい接続には送られない", async () => {
+      answerFetch("Answer");
+
+      const { el, clientSent, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await settle();
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.prompt = "Hi";
+      const result = outcome(el.send()); // waits for the provider ack
+
+      el.remove();
+      const moved = attachToNewServer(el); // re-applies `provider` on the new connection
+
+      expect(await result).toEqual({ value: null });
+      expect(codeOf(el.error)).toBe("WC_BINDABLE_DISPOSED");
+      await settle();
+      expect(sendCmds(clientSent)).toEqual([]);
+      expect(wireKinds(moved.clientSent)).toEqual(["sync", "set:provider"]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      // The new connection is unaffected: its sync cleared the error, and the
+      // next send() runs there.
+      expect(el.error).toBeNull();
+      await expect(el.send()).resolves.toBe("Answer");
+      expect(wireKinds(moved.clientSent)).toEqual(["sync", "set:provider", "cmd:send"]);
+
+      moved.cleanup();
+      cleanup();
+    });
+
+    it("providerを外す（removeAttribute）ackの待ち中に要素を外しても、付け直した後のsendは影響を受けない", async () => {
+      answerFetch("Answer");
+
+      const { el, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      el.setAttribute("provider", "openai");
+      await settle();
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.prompt = "Hi";
+      el.removeAttribute("provider"); // ack for `provider = null` in flight
+      const result = outcome(el.send());
+
+      el.remove();
+      expect(await result).toEqual({ value: null });
+      expect(codeOf(el.error)).toBe("WC_BINDABLE_DISPOSED");
+
+      // No `provider` attribute, so nothing is re-applied on re-attach: the
+      // DISPOSED of the old connection must not be held as a provider failure.
+      const again = attachToNewServer(el);
+      again.core.provider = "openai"; // the server decides the provider
+      await settle();
+      expect(el.error).toBeNull();
+      await expect(el.send()).resolves.toBe("Answer");
+
+      again.cleanup();
+      cleanup();
+    });
+
+    it("ackが本当に失敗した場合（サーバーがproviderを拒否）、ack待ちのsendは従来どおりrejectする", async () => {
+      const { el, clientSent, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await settle();
+      el.setAttribute("provider", "no-such-provider");
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+
+      await expect(el.send()).rejects.toThrow('Unknown provider: "no-such-provider"');
+      expect((el.error as Error).message).toContain('Unknown provider: "no-such-provider"');
+      expect(sendCmds(clientSent)).toEqual([]);
+
+      cleanup();
+    });
+
+    // The ack outcome is classified by error.code, like an invoke's: a code
+    // the server sends is never a transport failure, even one that names a
+    // consumer-only code (the proxy re-codes it to WC_BINDABLE_REMOTE_THROW).
+    for (const { sent, received } of [
+      { sent: "WC_BINDABLE_INVALID_JSON_VALUE", received: "WC_BINDABLE_INVALID_JSON_VALUE" },
+      { sent: "WC_BINDABLE_DISPOSED", received: "WC_BINDABLE_REMOTE_THROW" },
+      { sent: "WC_BINDABLE_TERMINAL_FAILURE", received: "WC_BINDABLE_REMOTE_THROW" },
+    ]) {
+      it(`サーバーがproviderのackを${sent}で失敗させた場合、ack待ちのsendは${received}でrejectする`, async () => {
+        let sentFrames: ClientMessage[] = [];
+        const fixture = createRemoteAi({
+          rewriteServerMessage: (msg) => {
+            const isProviderAck = msg.type === "return"
+              && sentFrames.some(m => m.type === "set" && m.name === "provider" && m.id === msg.id);
+            return isProviderAck
+              ? { type: "throw", id: msg.id, error: { name: "Error", message: "provider rejected", code: sent } }
+              : msg;
+          },
+        });
+        sentFrames = fixture.clientSent;
+        const { el, cleanup } = fixture;
+        document.body.appendChild(el);
+        await settle();
+        el.setAttribute("provider", "openai");
+        el.setAttribute("model", "gpt-4o");
+        el.prompt = "Hi";
+
+        await expect(el.send()).rejects.toMatchObject({ code: received, message: "provider rejected" });
+        expect(codeOf(el.error)).toBe(received);
+        expect(sendCmds(sentFrames)).toEqual([]);
+
+        cleanup();
+      });
+    }
+
+    it("ack待ち中にtransportがcloseすると、invoke後のcloseと同じくWC_BINDABLE_TERMINAL_FAILUREでnullに決着する", async () => {
+      const { el, clientSent, closeTransport, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await settle();
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+      const events = recordEvents(el);
+      const result = outcome(el.send());
+
+      closeTransport();
+
+      expect(await result).toEqual({ value: null });
+      expect(codeOf(el.error)).toBe("WC_BINDABLE_TERMINAL_FAILURE");
+      expect(events.errors).toEqual([el.error]); // the ack reported it; send() did not repeat it
+      expect(el.loading).toBe(false);
+      // Later calls find the connection closed as well.
+      await expect(el.send()).resolves.toBeNull();
+      expect(codeOf(el.error)).toBe("WC_BINDABLE_TERMINAL_FAILURE");
+      expect(sendCmds(clientSent)).toEqual([]);
+
+      cleanup();
+    });
+
+    for (const order of ["abort → 削除", "削除 → abort"] as const) {
+      it(`ack待ち中の${order}: sendは一度だけ先に起きた方で決着し、付け直した後のsendに影響しない`, async () => {
+        answerFetch("Answer");
+
+        const { el, clientSent, cleanup } = createRemoteAi();
+        document.body.appendChild(el);
+        await settle();
+        el.setAttribute("provider", "openai");
+        el.setAttribute("model", "gpt-4o");
+        el.stream = false;
+        el.prompt = "Hi";
+        const events = recordEvents(el);
+        const result = outcome(el.send());
+
+        if (order === "abort → 削除") {
+          el.abort();
+          el.remove();
+        } else {
+          el.remove();
+          el.abort();
+        }
+
+        expect(await result).toEqual({ value: null });
+        if (order === "abort → 削除") {
+          // Cancelled before the removal: the abort contract (error untouched).
+          expect(el.error).toBeNull();
+          expect(events.errors).toEqual([]);
+        } else {
+          // Settled by the removal; the later abort() has nothing to cancel.
+          expect(codeOf(el.error)).toBe("WC_BINDABLE_DISPOSED");
+          expect(events.errors).toEqual([el.error]);
+        }
+        await settle();
+        expect(sendCmds(clientSent)).toEqual([]);
+        expect(fetchSpy).not.toHaveBeenCalled();
+
+        const again = attachToNewServer(el);
+        await expect(el.send()).resolves.toBe("Answer");
+        expect(el.error).toBeNull();
+        expect(wireKinds(again.clientSent)).toEqual(["sync", "set:provider", "cmd:send"]);
+
+        again.cleanup();
+        cleanup();
+      });
+    }
   });
 
   // -----------------------------------------------------------------------
