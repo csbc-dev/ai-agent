@@ -18,10 +18,11 @@ import { AiHttpError } from "./types.js";
  * `MediaKeySession`, custom event payloads), and accepting them as
  * AiHttpError would mis-shape the public `error` contract.
  *
- * Note: this helper does NOT wrap `Error` instances in `AiSerializableError`.
- * That wrapping is a Core-only concern (needed for JSON transport via
- * `@wc-bindable/remote`) and is applied by `AiCore._setError` after this
- * narrowing.
+ * Note: this helper keeps `Error` instances as `Error`s. Turning them into
+ * the JSON-safe `AiSerializedError` snapshot is a Core-only concern (the
+ * Core's state must pass `@wc-bindable/remote`'s JsonValue gate) and is
+ * applied by `AiCore._setError` after this narrowing; Shell-level errors
+ * (`Ai._setErrorState`) never cross the wire and stay `Error` instances.
  */
 export function narrowError(error: unknown): AiHttpError | Error | null {
   if (error === null || error === undefined) return null;

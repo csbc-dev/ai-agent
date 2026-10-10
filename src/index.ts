@@ -16,7 +16,7 @@ export type {
   IConfig, ITagNames, IRemoteConfig,
   IWritableConfig, IWritableTagNames, IWritableRemoteConfig, IAiProvider,
   AiMessage, AiUsage, AiRequestOptions, AiProviderRequest, AiStreamChunkResult,
-  AiHttpError,
+  AiHttpError, AiSerializedError,
   AiAgentCoreValues, AiAgentValues,
   AiRole, AiFinishReason, AiToolCall, AiTool, AiToolChoice, AiToolCallDelta,
   AiContent, AiContentPart, AiContentTextPart, AiContentImagePart,

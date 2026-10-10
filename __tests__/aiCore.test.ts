@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describeNonJsonValue } from "@wc-bindable/remote";
 import { AiCore } from "../src/core/AiCore";
 
 function createMockResponse(body: any, options: { status?: number; ok?: boolean } = {}): Response {
@@ -319,6 +320,68 @@ describe("AiCore", () => {
       expect(core.messages[0].providerHints?.anthropic).toBeDefined();
     });
 
+    it("undefined値の任意フィールドは入れ子でも落とされ、履歴とイベントdetailがJsonValueに保たれる", () => {
+      // @wc-bindable/remote >= 0.10 は undefined を含む messages の update を
+      // 丸ごと破棄する。サーバ側コードが core.messages = ... で undefined 入りの
+      // 履歴を流し込んでもリモートクライアントへ届くよう、Core 側で正規化する。
+      const core = new AiCore();
+      const details: unknown[] = [];
+      core.addEventListener("ai-agent:messages-changed", (e) => details.push((e as CustomEvent).detail));
+
+      core.messages = [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "see image" },
+            { type: "image", url: "data:image/png;base64,AAAA", mediaType: undefined },
+          ],
+          toolCallId: undefined,
+          providerHints: { anthropic: { cacheControl: { type: "ephemeral", ttl: undefined } } },
+        },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "c1", name: "fn", arguments: "{}", extra: undefined } as any],
+          finishReason: undefined,
+        },
+        { role: "tool", content: "{}", toolCallId: "c1" },
+      ];
+
+      expect(core.messages).toStrictEqual([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "see image" },
+            { type: "image", url: "data:image/png;base64,AAAA" },
+          ],
+          providerHints: { anthropic: { cacheControl: { type: "ephemeral" } } },
+        },
+        { role: "assistant", content: "", toolCalls: [{ id: "c1", name: "fn", arguments: "{}" }] },
+        { role: "tool", content: "{}", toolCallId: "c1" },
+      ]);
+      expect(describeNonJsonValue(core.messages)).toBeNull();
+      expect(describeNonJsonValue(details.at(-1))).toBeNull();
+    });
+
+    it("send()のprompt partsにundefined値があってもmessagesはJsonValueのまま", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "ok" } }],
+      }));
+      const core = new AiCore();
+      core.provider = "openai";
+      const details: unknown[] = [];
+      core.addEventListener("ai-agent:messages-changed", (e) => details.push((e as CustomEvent).detail));
+
+      await core.send(
+        [{ type: "image", url: "https://example.com/a.png", mediaType: undefined }],
+        { model: "gpt-4o", stream: false },
+      );
+
+      expect(core.messages[0].content).toStrictEqual([{ type: "image", url: "https://example.com/a.png" }]);
+      expect(details.length).toBeGreaterThan(0);
+      for (const d of details) expect(describeNonJsonValue(d)).toBeNull();
+    });
+
     it("finishReasonは履歴再注入で保持される", () => {
       // A consumer serializes `core.messages` (local storage, server sync,
       // undo stack) and re-assigns it later — the finish reason must round-
@@ -588,21 +651,32 @@ describe("AiCore", () => {
   });
 
   describe("internal helpers", () => {
-    it("Error.toJSONはstackが空ならstackを含めない", () => {
+    it("Errorのsnapshotはstackが空ならstackキーを含めない", () => {
       const core = new AiCore();
       const error = new Error("boom");
       error.stack = "";
 
       (core as any)._setError(error);
 
-      // 呼び出し元の Error は mutate されない。core.error にはラッパが格納され、
-      // ラッパの toJSON が stack 空のときキーを省略する。
+      // 呼び出し元の Error は mutate されない。core.error には JSON-safe な
+      // snapshot が格納され、stack が空のときはキー自体を省略する（旧 toJSON と同じ）。
       expect((error as any).toJSON).toBeUndefined();
-      expect(typeof (core.error as any).toJSON).toBe("function");
-      expect((core.error as any).toJSON()).toEqual({
-        name: "Error",
-        message: "boom",
-      });
+      expect(core.error).not.toBe(error);
+      expect(core.error).toStrictEqual({ name: "Error", message: "boom" });
+      expect(core.error).not.toHaveProperty("stack");
+    });
+
+    it("name/messageが文字列でないErrorでもsnapshotは常にJsonValueになる", () => {
+      const core = new AiCore();
+      const error = new Error("x");
+      // 異常な Error（name / message が文字列でない）でも wire に載る形へ正規化する
+      Object.defineProperty(error, "name", { value: undefined });
+      Object.defineProperty(error, "message", { value: 42 });
+
+      (core as any)._setError(error);
+
+      expect(core.error).toMatchObject({ name: "Error", message: "42" });
+      expect(describeNonJsonValue(core.error)).toBeNull();
     });
 
     it("rAF未提供でもflushを一度だけ予約して実行できる", async () => {
@@ -1210,14 +1284,12 @@ describe("AiCore", () => {
       const result = await core.send("Hello", { model: "gpt-4o", stream: false });
 
       expect(result).toBeNull();
-      // AiCore wraps native Error subclasses (TypeError, DOMException, ...)
-      // in a serializable wrapper so JSON.stringify preserves name/message/stack
-      // without mutating the caller's Error. The wrapper extends Error and
-      // copies the original `name` so consumers branching on `error.name`
-      // (rather than `instanceof TypeError`) keep working.
-      expect(core.error).toBeInstanceOf(Error);
-      expect(core.error!.name).toBe("TypeError");
-      expect(core.error!.message).toBe("Failed to fetch");
+      // AiCore stores native Error subclasses (TypeError, DOMException, ...)
+      // as a JSON-safe AiSerializedError snapshot so @wc-bindable/remote >= 0.10
+      // can transmit it. The original `name` is kept, so consumers branching on
+      // `error.name` (rather than `instanceof TypeError`) keep working.
+      expect(core.error).not.toBeInstanceOf(Error);
+      expect(core.error).toMatchObject({ name: "TypeError", message: "Failed to fetch" });
       expect(core.messages).toEqual([]);
       expect(core.loading).toBe(false);
     });
@@ -1234,27 +1306,32 @@ describe("AiCore", () => {
       expect(core.messages).toEqual([]);
     });
 
-    it("Errorはラップされリモート直列化で情報が保持される", async () => {
+    it("ErrorはJSON-safeなfrozen snapshotとして保持され、getterとイベントdetailが一致する", async () => {
       const source = new TypeError("Network error");
       fetchSpy.mockRejectedValueOnce(source);
 
       const core = new AiCore();
       core.provider = "openai";
+      const details: unknown[] = [];
+      core.addEventListener("ai-agent:error", (e) => details.push((e as CustomEvent).detail));
       await core.send("Hello", { model: "gpt-4o", stream: false });
 
-      // Error インスタンスは AiCore 内部の serializable wrapper に差し替えられる。
-      // 呼び出し元の TypeError インスタンスは mutate されず、そのまま保持される。
-      expect(core.error).toBeInstanceOf(Error);
+      // Error インスタンスは plain object の snapshot に置き換えられる。
+      // 呼び出し元の TypeError インスタンスは mutate されない。
       expect(core.error).not.toBe(source);
       expect((source as any).toJSON).toBeUndefined();
+      expect(Object.getPrototypeOf(core.error)).toBe(Object.prototype);
+      expect(Object.isFrozen(core.error)).toBe(true);
       // name は元の "TypeError" を引き継ぐので、name ベースの分岐は維持できる。
-      expect(core.error!.name).toBe("TypeError");
-      // toJSON 付きで JSON.stringify に情報が保持される
-      expect(typeof (core.error as any).toJSON).toBe("function");
-      const serialized = JSON.parse(JSON.stringify(core.error));
-      expect(serialized.name).toBe("TypeError");
-      expect(serialized.message).toBe("Network error");
-      expect(serialized.stack).toBeDefined();
+      expect(core.error).toStrictEqual({
+        name: "TypeError",
+        message: "Network error",
+        stack: source.stack,
+      });
+      // RemoteShellProxy は sync で core.error を、update でイベント detail を
+      // そのまま JsonValue 検証する。両方が同一の JsonValue であること。
+      expect(describeNonJsonValue(core.error)).toBeNull();
+      expect(details.at(-1)).toBe(core.error);
     });
   });
 
@@ -2509,8 +2586,9 @@ describe("AiCore", () => {
       });
 
       expect(result).toBeNull();
-      expect(core.error).toBeInstanceOf(Error);
-      expect((core.error as Error).message).toContain("maxToolRoundtrips");
+      expect(core.error).toMatchObject({ name: "Error" });
+      expect((core.error as { message: string }).message).toContain("maxToolRoundtrips");
+      expect(describeNonJsonValue(core.error)).toBeNull();
       // 履歴はsend()開始前の状態にロールバックされる
       expect(core.messages).toEqual([]);
       expect(core.loading).toBe(false);

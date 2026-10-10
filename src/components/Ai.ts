@@ -19,12 +19,32 @@ import {
   type ClientTransport,
 } from "@wc-bindable/remote";
 import { bind } from "@wc-bindable/core";
+import { omitUndefinedProperties } from "../omitUndefinedProperties.js";
+
+// Errors revived from a Core's frozen AiSerializedError snapshot, keyed by
+// that snapshot. Memoizing keeps the element-level value identity-stable:
+// `el.error` and every bind() consumer of the element (which reads the event
+// through the declaration getter below) observe the very same Error for one
+// failure, as they did when the Core stored the Error itself.
+const revivedErrors = new WeakMap<object, Error>();
 
 export class Ai extends HTMLElement {
   static wcBindable: IWcBindable = {
     ...AiCore.wcBindable,
     properties: [
-      ...AiCore.wcBindable.properties,
+      // `error` carries an element-level getter. AiCore holds non-HTTP
+      // failures as JSON-safe AiSerializedError snapshots (required by
+      // @wc-bindable/remote >= 0.10), and in local mode it dispatches
+      // `ai-agent:error` directly on this element (target injection) with that
+      // snapshot as `detail`. The getter revives it so bind() consumers of
+      // <ai-agent> keep receiving the same `Error` as `el.error`, in local and
+      // remote mode alike. Values that are already an Error / AiHttpError /
+      // null (remote-mode and Shell-level dispatches) pass through unchanged.
+      // AiCore.wcBindable itself stays getter-free: the server-side
+      // RemoteShellProxy builds `update`s from it and must ship the snapshot.
+      ...AiCore.wcBindable.properties.map(p => p.name === "error"
+        ? { ...p, getter: (event: Event) => Ai._reviveError((event as CustomEvent).detail) }
+        : p),
       { name: "trigger", event: "ai-agent:trigger-changed" },
     ],
   };
@@ -167,19 +187,30 @@ export class Ai extends HTMLElement {
   /** @internal — visible for testing */
   private _connectRemote(transport: ClientTransport): void {
     // `logger` routes the proxy's diagnostic warnings (declaration-fingerprint
-    // mismatch on client/server version skew, ignored-sync values, etc.) through
-    // this package's dev-gated channel. `preSyncBehavior` defaults to the
-    // spec-conformant "queue" in @wc-bindable/remote 0.8.0, so pre-sync
-    // setWithAck/invoke calls (e.g. an early `provider` ack or `send()`) are
-    // replayed in order after the first sync rather than racing the wire.
+    // mismatch on client/server version skew, ignored-sync values, the
+    // `getterFailures` "keeping the last known value" notice, etc.) through
+    // this package's dev-gated channel.
+    //
+    // `preSyncBehavior` is left at the @wc-bindable/remote default, which is
+    // still "eager" (through 0.10 — the planned flip to the spec-conformant
+    // "queue" has not shipped). Pre-sync setWithAck/invoke calls (an early
+    // `provider` ack, a `send()` fired right after connect) are therefore
+    // written to the transport immediately, behind the proxy's own `sync`
+    // request rather than held until the sync response. The WebSocket is FIFO
+    // and RemoteShellProxy handles frames in order, so the server still
+    // answers the sync first; what "eager" gives up is only the local
+    // rejection of a pre-sync setWithAck against a producer that turns out
+    // not to advertise `setAck` (SPEC-extensions.md § Pre-sync call state
+    // machine) — that call rejects when the sync response arrives instead.
     this._proxy = createRemoteCoreProxy(AiCore.wcBindable, transport, {
       logger: remoteLogger,
     });
 
     // Bridge proxy events to this HTMLElement so framework adapters work
     this._unbind = bind(this._proxy, (name, value) => {
-      // Revive serialized Error objects back into Error instances so that
-      // el.error instanceof Error holds in remote mode just as it does locally.
+      // Revive the server Core's AiSerializedError snapshot back into an Error
+      // instance so el.error instanceof Error holds in remote mode just as it
+      // does locally (where `get error()` revives the local Core's snapshot).
       if (name === "error") {
         value = Ai._reviveError(value);
         // Preserve local provider error: a pending provider validation failure
@@ -427,7 +458,11 @@ export class Ai extends HTMLElement {
       }
       return this._errorState;
     }
-    return this._core?.error ?? this._errorState;
+    // AiCore stores non-HTTP failures as a JSON-safe AiSerializedError
+    // snapshot; present it as an Error at the element level, memoized so
+    // repeated reads (and the declaration getter) return the same instance.
+    const coreError = this._core?.error;
+    return coreError != null ? Ai._reviveError(coreError) as AiHttpError | Error : this._errorState;
   }
 
   get usage(): any {
@@ -449,7 +484,14 @@ export class Ai extends HTMLElement {
     // client-side assertions are consistent with AiCore.messages =).
     validateMessages(value);
     if (this._isRemote) {
-      this._proxy!.setWithAck("messages", value)
+      // Send the same normalized copy AiCore.messages = would store locally:
+      // cloneMessage drops `undefined`-valued optional fields (`toolCalls:
+      // undefined`, `mediaType: undefined`, …), which validateMessages accepts
+      // and which mean "absent", but which @wc-bindable/remote >= 0.10 would
+      // otherwise reject as non-JsonValue (WC_BINDABLE_INVALID_JSON_VALUE)
+      // before anything is sent. Genuinely non-JSON values (Date, NaN, class
+      // instances, …) are left for the proxy to reject; see README §Remote Mode.
+      this._proxy!.setWithAck("messages", value.map(cloneMessage))
         .then(() => this._clearErrorState())
         .catch((e: unknown) => this._setErrorState(e));
     } else if (this._core) {
@@ -582,25 +624,42 @@ export class Ai extends HTMLElement {
           this._warnedApiKeyDropped = true;
           errorApiKeyDroppedInRemoteMode();
         }
+        // The arguments must be a strict JsonValue: @wc-bindable/remote >= 0.10
+        // rejects the whole invoke (WC_BINDABLE_INVALID_JSON_VALUE, before
+        // anything is sent) if any property is `undefined` — it no longer
+        // drops such keys the way JSON.stringify did. Unset options are
+        // therefore OMITTED with conditional spreads, exactly like the local
+        // path below; substituting `null` is not an option because AiCore.send
+        // validates temperature / maxTokens / maxToolRoundtrips /
+        // responseSchema / streamOptions and rejects `null`. Caller-supplied
+        // structures (prompt parts, tool declarations, toolChoice,
+        // responseSchema) additionally get their `undefined`-valued keys
+        // omitted, matching how they behave in local mode (where they end up
+        // in a JSON.stringify'd provider request body). Other non-JSON values
+        // are left for the proxy to reject with a path.
+        //
         // Use invokeWithOptions with timeoutMs: 0 to disable the default 30s
         // timeout — AI inference and long streaming responses routinely exceed it.
-        return await this._proxy!.invokeWithOptions("send", [this._prompt, {
+        const temperature = this.temperature;
+        const maxTokens = this.maxTokens;
+        const streamOptions = this.streamOptions;
+        return await this._proxy!.invokeWithOptions("send", [omitUndefinedProperties(this._prompt), {
           model: this.model,
           stream: this.stream,
-          temperature: this.temperature,
-          maxTokens: this.maxTokens,
+          ...(temperature !== undefined ? { temperature } : {}),
+          ...(maxTokens !== undefined ? { maxTokens } : {}),
           system: this._collectSystem(),
           ...(forward ? {
             apiKey: this.apiKey,
             baseUrl: this.baseUrl,
             apiVersion: this.apiVersion,
           } : {}),
-          tools: remoteTools,
-          toolChoice: this._toolChoice,
-          maxToolRoundtrips: this._maxToolRoundtrips,
-          responseSchema: this._responseSchema ?? undefined,
-          responseSchemaName: this._responseSchemaName,
-          streamOptions: this.streamOptions,
+          ...(remoteTools ? { tools: omitUndefinedProperties(remoteTools) } : {}),
+          ...(this._toolChoice !== undefined ? { toolChoice: omitUndefinedProperties(this._toolChoice) } : {}),
+          ...(this._maxToolRoundtrips !== undefined ? { maxToolRoundtrips: this._maxToolRoundtrips } : {}),
+          ...(this._responseSchema != null ? { responseSchema: omitUndefinedProperties(this._responseSchema) } : {}),
+          ...(this._responseSchemaName !== undefined ? { responseSchemaName: this._responseSchemaName } : {}),
+          ...(streamOptions !== undefined ? { streamOptions } : {}),
         }], { timeoutMs: 0 }) as string | null;
       } catch (e) {
         if (Ai._isTransportError(e)) {
@@ -722,16 +781,28 @@ export class Ai extends HTMLElement {
     }
   }
 
-  /** Revive a serialized Error (from remote JSON) back into an Error instance. */
+  /**
+   * Revive an AiSerializedError snapshot — the local Core's frozen `error`
+   * value, or the server Core's copy decoded from the wire — into an Error
+   * instance. Memoized per snapshot object (see `revivedErrors`) so the
+   * element-level value is identity-stable across `el.error` reads and
+   * bind() deliveries.
+   */
   private static _reviveError(value: any): any {
     if (value == null || typeof value !== "object") return value;
-    // Serialized objects from JSON.parse are never Error instances, so the
-    // `instanceof Error` check is implicit. AiHttpError has 'status'; skip it.
+    // Already an Error (Shell-level failures, or a value this method already
+    // revived): pass through. Without this guard `"name" in value` would be
+    // true via Error.prototype and re-wrap it, losing identity and subclass.
+    if (value instanceof Error) return value;
+    // AiHttpError has 'status'; it stays a plain object.
     if ("status" in value) return value;
     if ("name" in value && "message" in value) {
+      const cached = revivedErrors.get(value);
+      if (cached) return cached;
       const err = new Error(value.message);
       err.name = value.name;
       if (value.stack) err.stack = value.stack;
+      revivedErrors.set(value, err);
       return err;
     }
     return value;

@@ -1,8 +1,17 @@
 import { AiMessage, AiContent } from "../types.js";
+import { omitUndefinedProperties } from "../omitUndefinedProperties.js";
 
+// Parts and tool calls are spread first so the copy never aliases the
+// caller's object (even when omitUndefinedProperties hands back an object it
+// declined to copy), then stripped of `undefined`-valued keys. An optional
+// field set to `undefined` (`{ type: "image", url, mediaType: undefined }`)
+// means "absent" everywhere in this package, but `@wc-bindable/remote` >= 0.10
+// rejects it on the wire — an `ai-agent:messages-changed` update carrying one
+// is dropped by the server-side RemoteShellProxy and never reaches a remote
+// client. Normalizing here keeps every history read and write free of them.
 function cloneContent(content: AiContent): AiContent {
   if (typeof content === "string") return content;
-  return content.map(part => ({ ...part }));
+  return content.map(part => omitUndefinedProperties({ ...part }));
 }
 
 function isDevelopment(): boolean {
@@ -57,9 +66,15 @@ function cloneProviderHints(hints: Record<string, any>): Record<string, any> {
 
 export function cloneMessage(m: AiMessage): AiMessage {
   const copy: AiMessage = { role: m.role, content: cloneContent(m.content) };
-  if (m.toolCalls) copy.toolCalls = m.toolCalls.map(tc => ({ ...tc }));
+  if (m.toolCalls) copy.toolCalls = m.toolCalls.map(tc => omitUndefinedProperties({ ...tc }));
   if (m.toolCallId !== undefined) copy.toolCallId = m.toolCallId;
   if (m.finishReason !== undefined) copy.finishReason = m.finishReason;
-  if (m.providerHints !== undefined) copy.providerHints = cloneProviderHints(m.providerHints);
+  if (m.providerHints !== undefined) {
+    // structuredClone keeps `undefined`-valued keys; strip them for the same
+    // wire reason as cloneContent above (providers JSON.stringify the hints
+    // into the request body, which drops them anyway, so local behavior is
+    // unchanged).
+    copy.providerHints = omitUndefinedProperties(cloneProviderHints(m.providerHints));
+  }
   return copy;
 }

@@ -139,6 +139,7 @@ src/
 ├── toolRegistry.ts          Process-wide tool handler registry (used in remote mode)
 ├── types.ts                 Public types (AiMessage / AiTool / AiHttpError, etc.)
 ├── debug.ts / raiseError.ts Dev-time warnings and error formatting
+├── omitUndefinedProperties.ts  Drops `undefined`-valued keys before values reach the remote wire
 ├── core/
 │   ├── AiCore.ts            Core (EventTarget) — history, streaming, tool loop
 │   ├── cloneMessage.ts      Deep-clone for AiMessage (prevents history mutation)
@@ -185,7 +186,7 @@ The Shell (`Ai.wcBindable`) adds a `trigger` property (`ai-agent:trigger-changed
 
 ### Responsibilities by layer
 
-- **`AiCore`** ([src/core/AiCore.ts](src/core/AiCore.ts)) — `Retry-After` header parsing, error wrapping via `AiSerializableError`, `requestAnimationFrame`-batched streaming content updates, the tool-call loop (`maxToolRoundtrips` defaults to 10), `responseSchema` structured output, and an instance-scoped tool handler registry (`registerTool`/`unregisterTool`). Uses `target` injection so events fire directly from the Shell's DOM node.
+- **`AiCore`** ([src/core/AiCore.ts](src/core/AiCore.ts)) — `Retry-After` header parsing, storing non-HTTP errors as a frozen JSON-safe `AiSerializedError` snapshot (`{ name, message, stack? }`, never an `Error` instance — see Remote mode below), `requestAnimationFrame`-batched streaming content updates, the tool-call loop (`maxToolRoundtrips` defaults to 10), `responseSchema` structured output, and an instance-scoped tool handler registry (`registerTool`/`unregisterTool`). Uses `target` injection so events fire directly from the Shell's DOM node.
 - **`<ai-agent>`** ([src/components/Ai.ts](src/components/Ai.ts)) — In local mode constructs `new AiCore(this)`; in remote mode connects to the server-side Core through `RemoteCoreProxy` + `WebSocketClientTransport` from `@wc-bindable/remote`. Holds `prompt` / `tools` / `toolChoice` / `maxToolRoundtrips` / `responseSchema` and assembles them into `AiRequestOptions` on `send()`.
 - **Provider layer** — Translates each vendor's request/response shape to and from `AiMessage` ⇄ `AiProviderRequest` / `AiStreamChunkResult`. `AiFinishReason` (`stop|length|tool_use|safety|other`) and `toolCallDeltas` (parallel tool calls) are normalized to a unified vocabulary as well.
 
@@ -193,7 +194,14 @@ The Shell (`Ai.wcBindable`) adds a `trigger` property (`ai-agent:trigger-changed
 
 `RemoteShellProxy` (server) / `RemoteCoreProxy` (client) from `@wc-bindable/remote` push the Core onto the server. The client-side `<ai-agent>` is unchanged; tool handlers registered via `registerTool()` on the server are invoked by the Core there, so API keys and authorization logic never reach the browser. Setting `remote.remoteSettingType` to `"env"` resolves the WebSocket URL from `process.env.AI_REMOTE_CORE_URL` or `globalThis.AI_REMOTE_CORE_URL`.
 
-The package pins `@wc-bindable/remote ^0.8.0`, which adds (transparently, no code change) a **declaration fingerprint** on every sync — the client compares the server's `AiCore.wcBindable` surface to its own and warns on version skew before it surfaces as a per-message rejection — plus capabilities negotiation and a spec-conformant pre-sync call queue. `<ai-agent>` injects a dev-gated `logger` (`remoteLogger` in [src/debug.ts](src/debug.ts)) into `createRemoteCoreProxy` so these remote-layer diagnostics carry the package prefix and respect the same `isDevelopment()` gate as the rest of the warnings. The protocol identifier is still `wc-bindable` v1; the `version` field in [src/types.ts](src/types.ts) is typed `number` (not the literal `1`) to match the protocol's forward-compatibility policy.
+The package pins `@wc-bindable/core` / `@wc-bindable/remote ^0.10.0`. The remote layer adds a **declaration fingerprint** on every sync — the client compares the server's `AiCore.wcBindable` surface to its own and warns on version skew before it surfaces as a per-message rejection — plus capabilities negotiation. `<ai-agent>` leaves `preSyncBehavior` at the library default, which is still `"eager"` (not the spec-conformant `"queue"`); see the comment in `Ai._connectRemote`. `<ai-agent>` injects a dev-gated `logger` (`remoteLogger` in [src/debug.ts](src/debug.ts)) into `createRemoteCoreProxy` so these remote-layer diagnostics carry the package prefix and respect the same `isDevelopment()` gate as the rest of the warnings. The protocol identifier is still `wc-bindable` v1; the `version` field in [src/types.ts](src/types.ts) is typed `number` (not the literal `1`) to match the protocol's forward-compatibility policy.
+
+Since 0.10 both proxies validate every value they **send** as a strict `JsonValue` (SPEC-extensions.md § Design invariants, invariant 3): `undefined` anywhere inside a value, `Date`, `NaN`, class instances (including `Error`, even with `toJSON`) are rejected, never coerced. This drives several deliberate shapes that look unusual — do not "simplify" them:
+
+- **`AiCore.error` holds a frozen plain `AiSerializedError`, not an `Error`.** `RemoteShellProxy` reads `core.error` directly for `sync` and the event `detail` for `update`, so both must be JSON-safe; an `Error` there means a dropped update / `getterFailures` and a remote `el.error` stuck at `null`. Do not add a getter to `AiCore.wcBindable` instead — the server builds its updates from that declaration and `Ai.wcBindable` spreads it.
+- **`Ai.wcBindable`'s `error` descriptor has a getter** that revives the snapshot (memoized per snapshot in `Ai._reviveError`), and `el.error` revives it in local mode too, so the element still exposes `Error` instances to `el.error` and `bind()` consumers in both modes.
+- **Remote `send()` omits unset options with conditional spreads** (mirroring the local path). Never substitute `null`: `AiCore.send` rejects `null` for `temperature` / `maxTokens` / `maxToolRoundtrips` / `responseSchema` / `streamOptions`.
+- **`undefined`-valued properties are omitted, everything else is left for the wire validator** ([src/omitUndefinedProperties.ts](src/omitUndefinedProperties.ts)). `cloneMessage` applies it to parts / tool calls / `providerHints`, the remote `messages` setter sends `value.map(cloneMessage)`, and remote `send()` applies it to the prompt, tools, `toolChoice` and `responseSchema`. It must not coerce `Date` / `NaN` / class instances — that would reintroduce the silent reshaping 0.10 removed.
 
 ### Configuration (`config.ts`)
 

@@ -280,15 +280,43 @@ export interface AiHttpError {
   retryAfter?: number;
 }
 
+/**
+ * JSON-safe snapshot of a non-HTTP failure (network error, provider
+ * `buildRequest` throw, `maxToolRoundtrips` exceeded, unparseable response,
+ * …) as held by `AiCore.error` and carried in the Core's `ai-agent:error`
+ * event detail.
+ *
+ * It is a frozen plain object rather than an `Error` instance because
+ * `@wc-bindable/remote` >= 0.10 only transmits strict `JsonValue`s
+ * (SPEC-extensions.md § Design invariants, invariant 3): an `Error` — even
+ * one with a `toJSON` — has a non-`Object.prototype` prototype, so its
+ * `update` would be dropped and its `sync` value reported in
+ * `getterFailures`, leaving a remote client's `error` stuck at `null`.
+ *
+ * `stack` is present only when the source error carried a non-empty stack.
+ * `<ai-agent>` revives this shape into an `Error` for `el.error` and for
+ * `bind()` consumers of the element, in both local and remote mode.
+ */
+export interface AiSerializedError {
+  readonly name: string;
+  readonly message: string;
+  readonly stack?: string;
+}
+
 export interface AiAgentCoreValues {
   content: string;
   messages: AiMessage[];
   usage: AiUsage | null;
   loading: boolean;
   streaming: boolean;
-  error: AiHttpError | Error | null;
+  // The Core holds JSON-safe data only (see AiSerializedError).
+  error: AiHttpError | AiSerializedError | null;
 }
 
 export interface AiAgentValues extends AiAgentCoreValues {
+  // The element revives AiSerializedError into an Error instance, so
+  // element-level consumers keep seeing `Error` (narrower than the Core's
+  // type: every Error structurally satisfies AiSerializedError).
+  error: AiHttpError | Error | null;
   trigger: boolean;
 }

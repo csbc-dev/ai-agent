@@ -2,7 +2,7 @@ import { raiseError } from "../raiseError.js";
 import { warnMalformedToolCall } from "../debug.js";
 import {
   IWcBindable, IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiTool, AiToolCall,
-  AiContentPart, AiFinishReason, AiHttpError,
+  AiContentPart, AiFinishReason, AiHttpError, AiSerializedError,
 } from "../types.js";
 import { assertKnownContentParts } from "../providers/contentHelpers.js";
 import { SseParser } from "../streaming/SseParser.js";
@@ -56,34 +56,40 @@ interface TurnResult {
 }
 
 /**
- * Wraps an arbitrary `Error` so that remote serialization via
- * `JSON.stringify` preserves `name` / `message` / `stack` without mutating
- * the caller-owned error instance. `instanceof Error` is preserved; the
- * specific subclass (`TypeError`, `DOMException`, …) is not, but the
- * original `name` is copied into `this.name` so downstream consumers that
- * branch on `error.name` (rather than `instanceof`) keep working.
+ * Snapshot an arbitrary `Error` into the JSON-safe `AiSerializedError` shape
+ * that `AiCore.error` holds — the same `name` / `message` / `stack` fields the
+ * former `AiSerializableError.toJSON()` put on the wire, and nothing else.
+ *
+ * Why a plain object rather than an `Error` (subclass) with `toJSON`:
+ * `@wc-bindable/remote` >= 0.10 validates every property value as a strict
+ * `JsonValue` (SPEC-extensions.md § Design invariants, invariant 3) and never
+ * calls `toJSON`. A value whose prototype is not `Object.prototype` is
+ * rejected, so an `Error` here would make RemoteShellProxy drop every
+ * `ai-agent:error` update and list `error` in `sync.getterFailures` — the
+ * remote client's `error` would stay `null` for network failures,
+ * `maxToolRoundtrips` exhaustion, unparseable responses, provider
+ * `buildRequest` throws, …. Note that `sync` reads `core.error` directly
+ * (not through a declaration getter), so the stored value itself must be
+ * JSON-safe, not just the event detail.
+ *
+ * The snapshot is frozen so a consumer holding `core.error` (or an event
+ * detail) cannot rewrite the Core's state, and so `<ai-agent>` can memoize
+ * the `Error` it revives from it by identity. The caller-owned source error is
+ * never mutated. `stack` is omitted when the source has none or an empty one
+ * (some callers blank it deliberately to suppress stack output), matching the
+ * former `toJSON`; non-string `name` / `message` are coerced so the snapshot
+ * is always a valid JsonValue.
  */
-class AiSerializableError extends Error {
-  constructor(source: Error) {
-    super(source.message);
-    this.name = source.name;
-    // Copy the source stack verbatim — including an empty string, which some
-    // callers set deliberately to suppress stack output from JSON.stringify.
-    // Leaving our constructor's auto-generated stack in place would leak an
-    // internal AiCore frame and mask the caller's intent.
-    if (typeof source.stack === "string") this.stack = source.stack;
-  }
-  toJSON(): { name: string; message: string; stack?: string } {
-    const payload: { name: string; message: string; stack?: string } = {
-      name: this.name,
-      message: this.message,
-    };
-    if (this.stack) payload.stack = this.stack;
-    return payload;
-  }
+function serializeError(source: Error): AiSerializedError {
+  const snapshot: { name: string; message: string; stack?: string } = {
+    name: typeof source.name === "string" ? source.name : "Error",
+    message: typeof source.message === "string" ? source.message : String(source.message),
+  };
+  if (typeof source.stack === "string" && source.stack !== "") snapshot.stack = source.stack;
+  return Object.freeze(snapshot);
 }
 
-type AiCoreError = AiHttpError | Error | null;
+type AiCoreError = AiHttpError | AiSerializedError | null;
 
 // Accumulator for streamed tool call fragments keyed by provider-reported index.
 interface ToolCallAccumulator {
@@ -242,19 +248,16 @@ export class AiCore extends EventTarget {
   }
 
   private _setError(error: unknown): void {
-    // Narrow first via the shared helper so Core/Shell agree on the public
-    // `AiHttpError | Error | null` contract, then layer Core's own concern
-    // on top: `Error` instances are wrapped in `AiSerializableError` so
-    // `JSON.stringify` preserves name/message/stack across remote transport.
+    // Narrow first via the shared helper so Core and Shell classify thrown
+    // values identically (null / AiHttpError / Error), then layer the Core's
+    // own concern on top: an `Error` is stored as a frozen JSON-safe
+    // `AiSerializedError` snapshot so both the `sync` read of `core.error`
+    // and the `update` built from this event's detail pass
+    // @wc-bindable/remote's JsonValue gate (see serializeError).
     const narrowed = narrowError(error);
-    let stored: AiCoreError;
-    if (narrowed instanceof AiSerializableError) {
-      stored = narrowed;
-    } else if (narrowed instanceof Error) {
-      stored = new AiSerializableError(narrowed);
-    } else {
-      stored = narrowed; // null or AiHttpError
-    }
+    const stored: AiCoreError = narrowed instanceof Error
+      ? serializeError(narrowed)
+      : narrowed; // null or AiHttpError (already a plain JSON-shaped object)
     this._error = stored;
     this._target.dispatchEvent(new CustomEvent("ai-agent:error", {
       detail: this._error,
