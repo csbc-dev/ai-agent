@@ -91,13 +91,17 @@ test("non-HTTP error propagates to error state as a JSON snapshot", async ({ pag
   const results = JSON.parse((await page.locator("#results").textContent())!);
 
   expect(results.networkErrorResult).toBeNull();
-  // The server Core's error is a plain { name, message, stack? } object that
+  // The server Core's error is a plain { name, message } object that
   // crossed the real WebSocket — not the previous HTTP error left in place by
   // a dropped update.
   expect(results.networkErrorState).not.toBeNull();
   expect(results.networkErrorState.name).toBe("TypeError");
   expect(typeof results.networkErrorState.message).toBe("string");
   expect(results.networkErrorState.status).toBeUndefined();
+  // The server's stack trace is not sent to the browser (it stays on
+  // core.originalError): the snapshot is exactly { name, message }.
+  expect(results.networkErrorState.stack).toBeUndefined();
+  expect(Object.keys(results.networkErrorState).sort()).toEqual(["message", "name"]);
 });
 
 test("bind() updates include loading transitions", async ({ page }) => {

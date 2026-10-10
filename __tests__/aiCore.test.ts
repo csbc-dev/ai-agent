@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { describeNonJsonValue } from "@wc-bindable/remote";
-import { AiCore } from "../src/core/AiCore";
+import { AiCore, inProcessErrorStack } from "../src/core/AiCore";
 
 function createMockResponse(body: any, options: { status?: number; ok?: boolean } = {}): Response {
   const { status = 200, ok = true } = options;
@@ -651,19 +651,84 @@ describe("AiCore", () => {
   });
 
   describe("internal helpers", () => {
-    it("Errorのsnapshotはstackが空ならstackキーを含めない", () => {
+    it.each([
+      ["空のstack", ""],
+      ["非空のstack", "Error: boom\n    at serverOnlyFrame (/srv/app.js:1:1)"],
+    ])("Errorのsnapshotはstackキーを含めない（%s）", (_label, stack) => {
       const core = new AiCore();
       const error = new Error("boom");
-      error.stack = "";
+      error.stack = stack;
 
       (core as any)._setError(error);
 
       // 呼び出し元の Error は mutate されない。core.error には JSON-safe な
-      // snapshot が格納され、stack が空のときはキー自体を省略する（旧 toJSON と同じ）。
+      // { name, message } の snapshot が格納され、stack はブラウザへ送らないので
+      // キー自体を持たない。stack は originalError（同じインスタンス）に残る。
       expect((error as any).toJSON).toBeUndefined();
       expect(core.error).not.toBe(error);
       expect(core.error).toStrictEqual({ name: "Error", message: "boom" });
       expect(core.error).not.toHaveProperty("stack");
+      expect(core.originalError).toBe(error);
+      expect(core.originalError!.stack).toBe(stack);
+    });
+
+    it("name / messageを読むと例外を投げるErrorでも_setErrorは例外を漏らさない", () => {
+      const core = new AiCore();
+      const error = new Error("x");
+      Object.defineProperty(error, "name", { get() { throw new Error("name getter"); } });
+      Object.defineProperty(error, "message", { get() { throw new Error("message getter"); } });
+
+      expect(() => (core as any)._setError(error)).not.toThrow();
+
+      expect(core.error).toStrictEqual({ name: "Error", message: "<unstringifiable thrown value>" });
+      expect(describeNonJsonValue(core.error)).toBeNull();
+      expect(core.originalError).toBe(error);
+    });
+
+    it("messageがString()できない値のErrorでも_setErrorは例外を漏らさない", () => {
+      const core = new AiCore();
+      const error = new Error("x");
+      Object.defineProperty(error, "message", { value: Object.create(null) });
+
+      expect(() => (core as any)._setError(error)).not.toThrow();
+
+      expect(core.error).toStrictEqual({ name: "Error", message: "<unstringifiable thrown value>" });
+    });
+
+    describe("inProcessErrorStack（ローカルの<ai-agent>がsnapshotにstackを戻すための内部リンク）", () => {
+      it("このrealmのCoreが格納したsnapshotには元の例外のstackを返す", () => {
+        const core = new AiCore();
+        const error = new TypeError("fetch failed");
+        error.stack = "TypeError: fetch failed\n    at inProcessFrame (app.js:1:1)";
+        (core as any)._setError(error);
+
+        expect(inProcessErrorStack(core.error!)).toBe(error.stack);
+      });
+
+      it("wireから復号したsnapshot（別オブジェクト）・AiHttpError・無関係なobjectにはundefined", () => {
+        const core = new AiCore();
+        (core as any)._setError(new TypeError("fetch failed"));
+        const decoded = JSON.parse(JSON.stringify(core.error));
+        expect(decoded).toStrictEqual(core.error);
+        expect(inProcessErrorStack(decoded)).toBeUndefined();
+
+        (core as any)._setError({ status: 500, statusText: "Internal Server Error", body: "" });
+        expect(inProcessErrorStack(core.error!)).toBeUndefined();
+        expect(inProcessErrorStack({ name: "Error", message: "x" })).toBeUndefined();
+      });
+
+      it("元の例外のstackが文字列でない・読むと例外を投げる場合はundefined", () => {
+        const core = new AiCore();
+        const noStack = new Error("no stack");
+        Object.defineProperty(noStack, "stack", { value: undefined });
+        (core as any)._setError(noStack);
+        expect(inProcessErrorStack(core.error!)).toBeUndefined();
+
+        const hostile = new Error("hostile");
+        Object.defineProperty(hostile, "stack", { get() { throw new Error("stack getter"); } });
+        (core as any)._setError(hostile);
+        expect(inProcessErrorStack(core.error!)).toBeUndefined();
+      });
     });
 
     it("name/messageが文字列でないErrorでもsnapshotは常にJsonValueになる", () => {
@@ -1323,11 +1388,12 @@ describe("AiCore", () => {
       expect(Object.getPrototypeOf(core.error)).toBe(Object.prototype);
       expect(Object.isFrozen(core.error)).toBe(true);
       // name は元の "TypeError" を引き継ぐので、name ベースの分岐は維持できる。
+      // stack はブラウザへ送る値に載せない（originalError に残る）。
       expect(core.error).toStrictEqual({
         name: "TypeError",
         message: "Network error",
-        stack: source.stack,
       });
+      expect(core.originalError!.stack).toBe(source.stack);
       // RemoteShellProxy は sync で core.error を、update でイベント detail を
       // そのまま JsonValue 検証する。両方が同一の JsonValue であること。
       expect(describeNonJsonValue(core.error)).toBeNull();
@@ -1451,8 +1517,9 @@ describe("AiCore", () => {
       expect(core.originalError!.stack).toBe(thrown.stack);
       expect((core.originalError as typeof thrown).cause).toBe(cause);
       expect((core.originalError as typeof thrown).requestId).toBe("REQ-7f3a");
-      // error is still the frozen JSON-safe snapshot of the same instance.
-      expect(core.error).toStrictEqual({ name: "TypeError", message: "fetch failed", stack: thrown.stack });
+      // error is still the frozen JSON-safe snapshot of the same instance —
+      // without the stack, which only the instance keeps.
+      expect(core.error).toStrictEqual({ name: "TypeError", message: "fetch failed" });
       expect(Object.isFrozen(core.error)).toBe(true);
     });
 
@@ -1536,16 +1603,102 @@ describe("AiCore", () => {
     });
 
     it.each([
-      ["文字列", "boom"],
-      ["statusを持たないplain object", { reason: "boom" }],
-    ])("ErrorでもHTTP形でもない値（%s）は、errorと同じname / message / stackのErrorになる", async (_label, thrown) => {
+      ["文字列", "boom", "boom"],
+      ["messageもstatusも持たないplain object", { reason: "boom" }, "[object Object]"],
+      ["messageが文字列でないplain object", { message: 42 }, "[object Object]"],
+    ])("ErrorでもHTTP形でもない値（%s）は、errorと同じname / messageのString(value)のErrorになる", async (_label, thrown, message) => {
       const core = await failWith(thrown);
 
       const original = core.originalError!;
       expect(original).toBeInstanceOf(Error);
       expect(original.name).toBe("Error");
-      expect(original.message).toBe(String(thrown));
-      expect(core.error).toStrictEqual({ name: original.name, message: original.message, stack: original.stack });
+      expect(original.message).toBe(message);
+      expect(typeof original.stack).toBe("string");
+      expect(core.error).toStrictEqual({ name: original.name, message: original.message });
+    });
+
+    describe("messageを持つ（Errorでない）objectのthrowはname / messageを保つ", () => {
+      it("{ code, message }はmessageを保ち、nameは\"Error\"", async () => {
+        const thrown = { code: "E_UPSTREAM", message: "upstream refused" };
+        const core = await failWith(thrown);
+
+        expect(core.error).toStrictEqual({ name: "Error", message: "upstream refused" });
+        const original = core.originalError!;
+        expect(original).toBeInstanceOf(Error);
+        expect(original).toMatchObject({ name: "Error", message: "upstream refused" });
+        // s3-uploader's toError: name / message only — no cause, no extra field.
+        expect((original as Error & { cause?: unknown }).cause).toBeUndefined();
+        expect("cause" in original).toBe(false);
+        expect((original as Error & { code?: unknown }).code).toBeUndefined();
+      });
+
+      it("{ name, message, stack }はname / messageを保ち、渡されたstackは使わない", async () => {
+        const thrown = { name: "AccessDenied", message: "denied", stack: "AccessDenied: denied\n    at foreignFrame (x.js:1:1)" };
+        const core = await failWith(thrown);
+
+        expect(core.error).toStrictEqual({ name: "AccessDenied", message: "denied" });
+        expect(core.originalError).toMatchObject({ name: "AccessDenied", message: "denied" });
+        expect(core.originalError!.stack).not.toBe(thrown.stack);
+      });
+
+      it.each([
+        ["空文字", ""],
+        ["文字列でない", 42],
+      ])("nameが%sならname \"Error\"", async (_label, name) => {
+        const core = await failWith({ name, message: "boom" });
+
+        expect(core.error).toStrictEqual({ name: "Error", message: "boom" });
+        expect(core.originalError!.name).toBe("Error");
+      });
+
+      it("Errorを継承しないクラスのインスタンス（別realmのError相当）も継承したname / messageを保つ", async () => {
+        class ForeignError {
+          message = "from another realm";
+          get name(): string { return "RangeError"; }
+        }
+        const core = await failWith(new ForeignError());
+
+        expect(core.error).toStrictEqual({ name: "RangeError", message: "from another realm" });
+      });
+
+      it("status / statusTextも持つobjectは従来どおりAiHttpErrorとして射影する（HTTP形の判定が優先）", async () => {
+        const thrown = { status: 503, statusText: "Service Unavailable", message: "upstream down" };
+        const core = await failWith(thrown);
+
+        expect(core.error).toStrictEqual({ status: 503, statusText: "Service Unavailable", body: "" });
+        expect(core.originalError).toMatchObject({ name: "AiHttpError", message: "HTTP 503 Service Unavailable" });
+        expect((core.originalError as Error & { cause?: unknown }).cause).toBe(thrown);
+      });
+    });
+
+    describe("String()できない値のthrowでも例外を漏らさず、send()はnullに決着してloadingは止まる", () => {
+      const revoked = (): object => {
+        const { proxy, revoke } = Proxy.revocable({}, {});
+        revoke();
+        return proxy;
+      };
+      it.each([
+        ["Object.create(null)", () => Object.create(null)],
+        ["toStringが例外を投げるobject", () => ({ toString() { throw new Error("no string form"); } })],
+        ["revokeされたProxy", revoked],
+        ["messageのgetterが例外を投げ、String()もできないobject", () => Object.create(null, {
+          message: { get() { throw new Error("message getter"); }, enumerable: true },
+        })],
+      ])("%s", async (_label, makeThrown) => {
+        const core = new AiCore();
+        const loading: boolean[] = [];
+        core.addEventListener("ai-agent:loading-changed", (e) => loading.push((e as CustomEvent).detail));
+        await failWith(makeThrown(), core);
+
+        expect(core.loading).toBe(false);
+        expect(core.streaming).toBe(false);
+        expect(loading).toEqual([true, false]);
+        expect(core.messages).toEqual([]);
+        expect(core.error).toStrictEqual({ name: "Error", message: "<unstringifiable thrown value>" });
+        expect(describeNonJsonValue(core.error)).toBeNull();
+        expect(core.originalError).toBeInstanceOf(Error);
+        expect(core.originalError!.message).toBe("<unstringifiable thrown value>");
+      });
     });
 
     it("送信前の検証エラーはoriginalErrorを変えず、abortは何も記録しない", async () => {

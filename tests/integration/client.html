@@ -110,7 +110,7 @@
       log("errorState", proxy.error);
 
       // --- Test 6: Non-HTTP error (the server-side fetch itself throws) ---
-      // AiCore holds it as a JSON-safe { name, message, stack? } snapshot;
+      // AiCore holds it as a JSON-safe { name, message } snapshot (no stack);
       // @wc-bindable/remote >= 0.10 drops the update if it is an Error.
       const networkErrorResult = await proxy.invoke("send", "Boom", {
         model: "gpt-4o",

@@ -1011,6 +1011,82 @@ describe("Ai (ai-agent)", () => {
       unbind();
     });
 
+    // The Core's snapshot carries no stack (it is what a server sends to the
+    // browser). A local element's Core runs in this page, so the Error it
+    // revives keeps the stack of the original exception.
+    function errorWithStack(marker: string): TypeError {
+      const thrown = new TypeError("Failed to fetch");
+      thrown.stack = `TypeError: Failed to fetch\n    at ${marker} (app.js:1:1)`;
+      return thrown;
+    }
+
+    it("el.error / bind()のErrorは元の例外のstackを持ち、snapshot（core.error / 生のdetail）はstackを持たない", async () => {
+      const thrown = errorWithStack("localFrame_bindFirst");
+      fetchSpy.mockRejectedValueOnce(thrown);
+      const el = createLocalAi();
+      // bind() first, so the declaration getter is what revives the snapshot.
+      const bound: unknown[] = [];
+      const unbind = bind(el, (name, value) => {
+        if (name === "error") bound.push(value);
+      });
+      const rawDetails: unknown[] = [];
+      el.addEventListener("ai-agent:error", (e) => rawDetails.push((e as CustomEvent).detail));
+
+      el.prompt = "Hi";
+      await expect(el.send()).resolves.toBeNull();
+
+      const revived = bound.at(-1) as Error;
+      expect(revived).toBeInstanceOf(Error);
+      expect(revived).toMatchObject({ name: "TypeError", message: "Failed to fetch" });
+      expect(revived.stack).toBe(thrown.stack);
+      expect(el.error).toBe(revived);
+      // The snapshot itself: { name, message } only.
+      const core = (el as any)._core as AiCore;
+      expect(rawDetails.at(-1)).toBe(core.error);
+      expect(core.error).toStrictEqual({ name: "TypeError", message: "Failed to fetch" });
+      expect(core.originalError).toBe(thrown);
+
+      unbind();
+    });
+
+    it("el.errorを先に読んでも元の例外のstackになる", async () => {
+      const thrown = errorWithStack("localFrame_readFirst");
+      fetchSpy.mockRejectedValueOnce(thrown);
+      const el = createLocalAi();
+
+      el.prompt = "Hi";
+      await expect(el.send()).resolves.toBeNull();
+
+      expect((el.error as Error).stack).toBe(thrown.stack);
+      expect((el as any)._core.error).not.toHaveProperty("stack");
+    });
+
+    it("messageを持つplain objectのthrowはそのname / messageのErrorとしてel.errorに届く", async () => {
+      fetchSpy.mockRejectedValueOnce({ name: "QuotaExceeded", message: "quota exceeded", code: "E_QUOTA" });
+      const el = createLocalAi();
+
+      el.prompt = "Hi";
+      await expect(el.send()).resolves.toBeNull();
+
+      expect(el.error).toBeInstanceOf(Error);
+      expect(el.error).toMatchObject({ name: "QuotaExceeded", message: "quota exceeded" });
+      expect(el.loading).toBe(false);
+    });
+
+    it("String()できない値のthrowでもsendはnullに決着し、loadingは止まる", async () => {
+      fetchSpy.mockRejectedValueOnce(Object.create(null));
+      const el = createLocalAi();
+
+      el.prompt = "Hi";
+      await expect(el.send()).resolves.toBeNull();
+
+      expect(el.loading).toBe(false);
+      expect(el.streaming).toBe(false);
+      expect(el.error).toBeInstanceOf(Error);
+      expect((el.error as Error).message).toBe("<unstringifiable thrown value>");
+      expect(el.messages).toEqual([]);
+    });
+
     it("errorの宣言getterはAi側だけに付き、AiCore.wcBindableは変えない", () => {
       const shellError = Ai.wcBindable.properties.find(p => p.name === "error")!;
       const coreError = AiCore.wcBindable.properties.find(p => p.name === "error")!;
@@ -1093,7 +1169,9 @@ describe("Ai (ai-agent)", () => {
   });
 
   describe("internal helpers", () => {
-    it("serialized error objectをErrorインスタンスへ復元する", () => {
+    it("serialized error objectをErrorインスタンスへ復元し、wireから来たstackは使わない", () => {
+      // An older server may still send a `stack` field: the server's trace is
+      // not put on the browser-side Error.
       const revived = (Ai as any)._reviveError({
         name: "RemoteError",
         message: "boom",
@@ -1103,7 +1181,8 @@ describe("Ai (ai-agent)", () => {
       expect(revived).toBeInstanceOf(Error);
       expect(revived.name).toBe("RemoteError");
       expect(revived.message).toBe("boom");
-      expect(revived.stack).toBe("stack-trace");
+      expect(revived.stack).not.toBe("stack-trace");
+      expect(String(revived.stack)).not.toContain("stack-trace");
     });
 
     it("同じsnapshotからの復元は同一のErrorインスタンスを返す（memoize）", () => {

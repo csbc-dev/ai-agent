@@ -310,14 +310,20 @@ export interface AiHttpError {
  * `update` would be dropped and its `sync` value reported in
  * `getterFailures`, leaving a remote client's `error` stuck at `null`.
  *
- * `stack` is present only when the source error carried a non-empty stack.
+ * It carries no `stack`: this is the value `RemoteShellProxy` sends to the
+ * browser, and a server-side stack trace (internal paths, dependency layout)
+ * must not cross that untrusted boundary (SPEC-extensions.md § Error
+ * envelope, "Security note on `stack` and `cause`"). The exception itself,
+ * stack included, stays in-process as `AiCore.originalError`.
+ *
  * `<ai-agent>` revives this shape into an `Error` for `el.error` and for
- * `bind()` consumers of the element, in both local and remote mode.
+ * `bind()` consumers of the element, in both local and remote mode. In local
+ * mode that `Error` carries the stack of the original exception (the Core
+ * runs in the same page); in remote mode it carries none of the server's.
  */
 export interface AiSerializedError {
   readonly name: string;
   readonly message: string;
-  readonly stack?: string;
 }
 
 export interface AiAgentCoreValues {

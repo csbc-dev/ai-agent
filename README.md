@@ -402,11 +402,21 @@ console.log("History:", core.messages);
 unbind();
 ```
 
-`core.error` is `AiHttpError | AiSerializedError | null`. A non-HTTP failure (network error, `maxToolRoundtrips` exceeded, a provider `buildRequest` throw, …) is stored as a frozen plain object `{ name, message, stack? }` — **not** an `Error` instance — so the Core's state can cross `@wc-bindable/remote` (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). Branch on `"status" in error` (HTTP) and `error.name` / `error.message`, not on `instanceof Error`. The original `name` (`"TypeError"`, `"SyntaxError"`, …) is preserved. An HTTP failure is likewise always a fresh plain `AiHttpError` `{ status, statusText, body, retryAfter? }`: a thrown value that is not an `Error` but carries a finite numeric `status` and a `statusText` — a `Response`, an HTTP-error class that does not extend `Error`, a custom provider's object — is projected onto those fields (a non-string `statusText` / `body` becomes `""`, so a `Response`'s unread body stream is not kept; `retryAfter` is kept only as a non-negative number; everything else is dropped) instead of being stored as is.
+`core.error` is `AiHttpError | AiSerializedError | null`. A non-HTTP failure (network error, `maxToolRoundtrips` exceeded, a provider `buildRequest` throw, …) is stored as a frozen plain object `{ name, message }` — **not** an `Error` instance — so the Core's state can cross `@wc-bindable/remote` (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). Branch on `"status" in error` (HTTP) and `error.name` / `error.message`, not on `instanceof Error`. The original `name` (`"TypeError"`, `"SyntaxError"`, …) is preserved. The snapshot has no `stack`: in a remote setup it is what the browser receives, and a server-side stack trace (internal paths, dependency layout) is not sent across that boundary ([SPEC-extensions.md § Error envelope](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/SPEC-extensions.md#error-envelope), security note on `stack`). Read the stack from `core.originalError` (below). A thrown value that is neither an `Error` nor HTTP-shaped is stored the same way: an object with a string `message` (a plain `{ code, message }`, a `{ name, message }` from another realm) keeps that `message`, and its `name` when that is a non-empty string (`"Error"` otherwise); any other value becomes `String(value)`, or `"<unstringifiable thrown value>"` when `String()` itself throws (`Object.create(null)`, …). An HTTP failure is likewise always a fresh plain `AiHttpError` `{ status, statusText, body, retryAfter? }`: a thrown value that is not an `Error` but carries a finite numeric `status` and a `statusText` — a `Response`, an HTTP-error class that does not extend `Error`, a custom provider's object — is projected onto those fields (a non-string `statusText` / `body` becomes `""`, so a `Response`'s unread body stream is not kept; `retryAfter` is kept only as a non-negative number; everything else is dropped) instead of being stored as is.
 
-The exception behind `core.error` stays available in-process as `core.originalError` (`Error | null`): the thrown `Error` instance itself (class, `stack`, `cause`, extra fields), or for an HTTP failure an `Error` named `"AiHttpError"` whose `cause` is the original value. It is set before `ai-agent:error` fires and is `null` whenever `error` is. It is not part of the bindable surface. See [Logging the original exception](#logging-the-original-exception-coreoriginalerror).
+The exception behind `core.error` stays available in-process as `core.originalError` (`Error | null`): the thrown `Error` instance itself (class, `stack`, `cause`, extra fields), or for an HTTP failure an `Error` named `"AiHttpError"` whose `cause` is the original value. For any other thrown value it is the `Error` the Core built in its place (same `name` / `message` as `core.error`, no `cause`). It is set before `ai-agent:error` fires and is `null` whenever `error` is. It is not part of the bindable surface. See [Logging the original exception](#logging-the-original-exception-coreoriginalerror).
 
 > **Breaking change (`@wc-bindable` 0.10 upgrade).** `AiCore.error` and the `detail` of the Core's `ai-agent:error` event used to be an `Error` (an internal subclass carrying `toJSON`). They are now the plain `AiSerializedError` snapshot, because `@wc-bindable/remote` 0.10 drops any property value that is not a strict `JsonValue` — with the old shape a remote client's `error` stayed `null` for every non-HTTP failure. The element surface is unchanged: `el.error` and values delivered by `bind()` / framework adapters on `<ai-agent>` are still `Error` instances in local and remote mode. The one element-level difference is a raw `addEventListener("ai-agent:error", …)` on a **local-mode** element, whose `event.detail` is now the plain snapshot (it is dispatched by the Core); read `el.error` there if you need the `Error`.
+
+> **Breaking change: the server's `stack` is no longer sent to the browser.** `AiSerializedError` was `{ name, message, stack? }`; it is now `{ name, message }`, so `core.error` — and with it every `sync` / `update` of `error` — no longer carries the stack trace. This follows the security note on `stack` in [SPEC-extensions.md § Error envelope](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/SPEC-extensions.md#error-envelope) (producers SHOULD omit it across an untrusted boundary by default), as `@csbc-dev/s3-uploader`, `@csbc-dev/feature-flags` and `@csbc-dev/ami-voice` already do. What changes for you:
+>
+> - **Server code** that read `core.error.stack` reads `core.originalError.stack` instead. In TypeScript, `AiSerializedError` no longer has a `stack` member.
+> - **Remote mode:** `el.error.stack` — and the `stack` of the `Error` that `bind()` / framework adapters receive — is no longer the server's stack trace. It is the stack of the browser code that rebuilt the `Error`, so do not use it to locate the failure; log `core.originalError` on the server ([Logging the original exception](#logging-the-original-exception-coreoriginalerror)). `name` and `message` are unchanged. A server still running an earlier version may keep sending a `stack` field; `<ai-agent>` ignores it.
+> - **Local mode:** `el.error.stack` is unchanged — still the stack of the original exception, because the Core runs in the same page and nothing crosses a network boundary. Only the raw `event.detail` of a local element's `ai-agent:error` (the Core's snapshot) loses its `stack` field.
+>
+> This covers `error` — every failure the Core records. A remote `send()` that is *rejected* instead (the server's `AiCore.send()` refusing its arguments, see [Error contract](#error-contract)) reaches the browser as the `throw` reply `RemoteShellProxy` builds from the thrown `Error`, and in `@wc-bindable/remote` 0.10 that envelope still includes the validation error's `stack`. That envelope is built by the remote layer, not by this package.
+>
+> Also changed: a thrown object that is not an `Error` and has a string `message` (and no `status` / `statusText`) now keeps that `message` — and its `name` — in `core.error`, `core.originalError` and `el.error`; it used to read `"[object Object]"`. A thrown value that cannot be converted to a string no longer makes `send()` reject with the conversion's `TypeError` and leaves `loading` stuck at `true`: it is recorded as an `Error` with the message `"<unstringifiable thrown value>"`, like any other failure.
 
 ### Custom provider
 
@@ -822,7 +832,8 @@ static wcBindable = {
   properties: [
     // Same descriptors as AiCore, except that `error` gains a getter which
     // revives the Core's JSON-safe AiSerializedError snapshot into an Error,
-    // so bind() consumers of the element see the same value as `el.error`.
+    // so bind() consumers of the element see the same value as `el.error`
+    // (with the original exception's stack only when the Core is local).
     ...AiCore.wcBindable.properties.map(p => p.name === "error"
       ? { ...p, getter: (e) => reviveError(e.detail) }
       : p),
@@ -1024,7 +1035,7 @@ Remote-mode failures are exposed through the same `ai-agent:error` event and `el
 
 Any other `send()` failure is re-thrown, matching the local-mode contract: errors thrown by the server's `AiCore.send()` before it dispatches (validation such as a missing `model`), a non-JSON argument (`"WC_BINDABLE_INVALID_JSON_VALUE"`, see below) and `"WC_BINDABLE_PROTOCOL_ERROR"` — client and server use different protocol versions (or a wire bug), which retrying cannot fix. A call reported as `"WC_BINDABLE_ABORTED"` resolves to `null` without an error, like any abort.
 
-Failures the server's `AiCore` records after dispatch (provider HTTP 4xx/5xx, network failures, `maxToolRoundtrips` exceeded, unparseable responses, …) behave as in local mode: `el.send()` resolves to `null` and `el.error` is populated. The Core holds non-HTTP failures as a plain `{ name, message, stack? }` snapshot (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)), and `<ai-agent>` revives it into an `Error` — both for a live update and for the initial sync of a Core that already holds an error. The exception itself (its `cause`, extra fields, class) stays on the server as `core.originalError` — see [Logging the original exception](#logging-the-original-exception-coreoriginalerror).
+Failures the server's `AiCore` records after dispatch (provider HTTP 4xx/5xx, network failures, `maxToolRoundtrips` exceeded, unparseable responses, …) behave as in local mode: `el.send()` resolves to `null` and `el.error` is populated. The Core holds non-HTTP failures as a plain `{ name, message }` snapshot (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)), and `<ai-agent>` revives it into an `Error` with that `name` / `message` — both for a live update and for the initial sync of a Core that already holds an error. The exception itself (its `stack`, `cause`, extra fields, class) stays on the server as `core.originalError` — see [Logging the original exception](#logging-the-original-exception-coreoriginalerror). The revived `Error`'s `stack` is not the server's: it is the stack of the browser code that rebuilt it. (A local element's `el.error` keeps the original exception's stack — the Core runs in the page.)
 
 ### Values sent over the wire (`JsonValue`)
 
@@ -1034,7 +1045,7 @@ What `<ai-agent>` and `AiCore` handle for you:
 
 - **Unset options are omitted.** `send()` puts only the options you actually set (`temperature`, `max-tokens`, `tools`, `toolChoice`, `maxToolRoundtrips`, `responseSchema`, `responseSchemaName`, `stream-options`) into the `send` command, exactly like local mode.
 - **`undefined`-valued properties mean "absent".** In the prompt parts, tool declarations (whose `handler` is stripped as well), `toolChoice`, `responseSchema` and `el.messages = [...]`, a property whose value is `undefined` (`{ type: "image", url, mediaType: undefined }`, `toolCalls: undefined`, …) is omitted before sending — the meaning it already has in local mode. `AiCore` applies the same rule to the history it stores, so server code that assigns `core.messages` or calls `core.send()` with such fields still syncs to the browser.
-- **Core state is JSON-safe.** `AiCore.error` is a plain `AiHttpError` (projected even when the failure was thrown as a `Response` or a class instance — see [Headless Usage](#headless-usage-core-only)) or a frozen `AiSerializedError` (`{ name, message, stack? }`), never an `Error` instance; `<ai-agent>` presents the latter as an `Error` (see [Error contract](#error-contract)). The exception itself stays on the server as `core.originalError`, which is not declared and never sent.
+- **Core state is JSON-safe.** `AiCore.error` is a plain `AiHttpError` (projected even when the failure was thrown as a `Response` or a class instance — see [Headless Usage](#headless-usage-core-only)) or a frozen `AiSerializedError` (`{ name, message }` — no `stack`), never an `Error` instance; `<ai-agent>` presents the latter as an `Error` (see [Error contract](#error-contract)). The exception itself, stack included, stays on the server as `core.originalError`, which is not declared and never sent.
 
 What stays your responsibility: put only JSON data into `el.prompt`, `el.messages`, `el.tools` (`parameters`), `el.toolChoice` and `el.responseSchema` — convert `Date`s to ISO strings, and unwrap reactive-library values that carry accessors or symbol keys (MobX `toJS()`, Vue `toRaw()`, Solid `unwrap()`). Anything else fails before it reaches the network:
 
@@ -1156,7 +1167,7 @@ For WebSocket servers, the simpler and safer default is a fresh `AiCore` per `co
 
 #### Logging the original exception (`core.originalError`)
 
-`core.error` is what the browser receives, so it is always JSON-safe: a plain `AiHttpError` or a frozen `{ name, message, stack? }` snapshot (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). It has no class, no `cause` and no extra fields. To log or monitor the failure itself on the server, read **`core.originalError`**:
+`core.error` is what the browser receives, so it is always JSON-safe: a plain `AiHttpError` or a frozen `{ name, message }` snapshot (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). It has no class, no `stack`, no `cause` and no extra fields. To log or monitor the failure itself on the server, read **`core.originalError`**:
 
 ```ts
 class AiCore extends EventTarget {
@@ -1185,7 +1196,7 @@ wss.on("connection", (ws) => {
   |---|---|
   | snapshot of a thrown `Error` (network failure, provider `buildRequest` throw, unparseable response, `maxToolRoundtrips` exceeded, …) | that `Error` instance itself — its class, `stack`, `cause` and any extra fields intact (for example Node's `TypeError: fetch failed` with the socket error in `cause`) |
   | `AiHttpError` (a provider 4xx / 5xx, or a thrown `Response` / HTTP-error object) | `Error` named `"AiHttpError"` with the message `HTTP <status> <statusText>` (`HTTP <status>` when `statusText` is empty). Its `cause` is the original value: the response fields as the Core read them (`{ status, statusText, body, retryAfter? }`), or the thrown `Response` / object, including what the projection drops (headers, URL, extra fields) |
-  | snapshot of any other thrown value (a string, a plain object without `status` / `statusText`, …) | the `Error` the Core built in its place: the same `name` / `message` / `stack` as `core.error` |
+  | snapshot of any other thrown value (a string, a plain object without `status` / `statusText`, …) | the `Error` the Core built in its place, with the same `name` / `message` as `core.error`: an object with a string `message` gives that `message` and its `name`; any other value gives `String(value)` (`"<unstringifiable thrown value>"` when that throws). Nothing else of the thrown value is kept, and it is not attached as `cause` |
   | `null` | `null` |
 
 - **When it changes.** It is set together with `error`, **before** the Core dispatches `ai-agent:error`, so a listener on the Core (or on the `target` you constructed it with) can read it. It is `null` whenever `error` is, including when the next `send()` clears both at its start.
@@ -1379,10 +1390,10 @@ interface AiHttpError {
 }
 
 // Frozen JSON-safe snapshot of a non-HTTP failure, as held by AiCore.error.
+// No `stack`: it is what the browser receives (the stack stays on originalError).
 interface AiSerializedError {
   readonly name: string;
   readonly message: string;
-  readonly stack?: string;   // omitted when the source error had none / an empty one
 }
 
 interface AiAgentCoreValues {   // values of AiCore
@@ -1532,9 +1543,10 @@ A cross-cutting summary of how each failure class surfaces, consolidated from th
 | Tool handler throws | Tool message `{error}` | string (loop continues) | includes tool-error message | `null` |
 | Unknown tool name from model | Tool message `{error}` | string (loop continues) | includes tool-error message | `null` |
 | `maxToolRoundtrips` exceeded | `el.error` | `null` | rolled back for this send() | `Error` |
-| Network failure, unparseable response, provider `buildRequest` throw | `el.error` | `null` | rolled back for this send() | `Error` (original `name` kept) |
+| Network failure, unparseable response, provider `buildRequest` throw | `el.error` | `null` | rolled back for this send() | `Error` (original `name` kept; in remote mode without the server's `stack`) |
 | Provider HTTP 4xx / 5xx | `el.error` | `null` | user turn rolled back | `AiHttpError` |
 | Non-`Error` thrown with numeric `status` + `statusText` (a `Response`, an HTTP-error class, …) | `el.error` | `null` | rolled back for this send() | `AiHttpError` (plain projection) |
+| Any other non-`Error` thrown value (a plain `{ code, message }`, a string, `Object.create(null)`, …) | `el.error` | `null` | rolled back for this send() | `Error` (an object's string `message` and `name` kept; otherwise `String(value)`, or `"<unstringifiable thrown value>"`) |
 | Abort (`abort()` or new `send()`) | Neither (control signal) | `null` | rolled back | `null` (**not set**) |
 | Remote `abort()` while `send()` still waits for a `provider` ack (the call is never sent) | Neither (control signal) | `null` | unchanged | unchanged |
 | Element removed during `send()` — local mode | Neither (it aborts the request) | `null` | rolled back | `null` (**not set**) |
