@@ -132,6 +132,8 @@ The only runtime dependencies are [`@wc-bindable/core`](../wc-bindable-core) and
 ```
 src/
 ├── index.ts                 Public API barrel
+├── server.ts                Node entry (@csbc-dev/ai-agent/server): headless barrel, no HTMLElement
+├── withoutThrowInternals.ts ServerTransport wrapper that strips stack / cause from throw replies (wc-bindable-protocol#38)
 ├── bootstrapAi.ts           Entry: setConfig + registerComponents
 ├── registerComponents.ts    Idempotent guard wrapper around customElements.define
 ├── config.ts                Global config (tagNames / autoTrigger / remote)
@@ -172,6 +174,10 @@ src/
 - **Config readers**: `getConfig()` / `getRemoteCoreUrl()` / `resetConfig()`
 - **Types**: `AiMessage` / `AiTool` / `AiToolCall` / `AiContent(*)Part` / `AiHttpError` / `AiUsage` / `AiRequestOptions` / `AiAgentCoreValues` / `AiAgentValues` and more
 
+### Server entry (`src/server.ts` → `@csbc-dev/ai-agent/server`)
+
+A headless barrel with no `HTMLElement`, so it loads under plain Node: `AiCore`, the four providers, the tool registry, `withoutThrowInternals` / `WithoutThrowInternalsOptions`, and the Core types. It does not export the Shell, bootstrap, config or `AiAgentValues`. The root barrel pulls in `<ai-agent>` and fails under Node with `HTMLElement is not defined`, so server code imports from `/server`.
+
 ### Bindable surface
 
 `AiCore.wcBindable` (exposed by the Core directly):
@@ -205,6 +211,8 @@ Since 0.10 both proxies validate every value they **send** as a strict `JsonValu
 - **`AiCore.originalError` is the in-process exception behind `error`, deliberately undeclared** (same name and meaning as `S3Core.originalError` in s3-uploader). `_setError` sets `_errorSource` via `toOriginalError` *before* dispatching `ai-agent:error`, and clears it together with `error`.
   - A thrown `Error` is kept as the same instance. An `AiHttpError` becomes an `Error` named `"AiHttpError"` (`HTTP <status> <statusText>`) whose non-enumerable `cause` is the original value (the `_fetchTurn` fields or the thrown `Response` / object). Any other value is the `Error` that `narrowError` built, so name / message / stack match `error`.
   - Do not add it to `AiCore.wcBindable`: an `Error` fails the JsonValue gate (dropped updates, `getterFailures`), and it would change the declaration fingerprint. Do not copy or freeze it. Validation rejections and aborts never set it.
+- **`withoutThrowInternals` (`@csbc-dev/ai-agent/server`) only strips `stack` and `cause` from `throw` messages.** It keeps `name` / `message` / `code` and never touches `sync` / `update` / `return`. `onThrow` receives the envelope before stripping, and a throwing `onThrow` still lets the reply go out. Do not export it from the browser barrel, and do not remove it until upstream wc-bindable-protocol#38 is fixed.
+- **A tool handler's throw is stringified by `toolFailureMessage`** (the same rules as `narrowError`) into the tool message. It never throws and is never recorded on `error`; `null` / `undefined` stay `String()`.
 - **`Ai.wcBindable`'s `error` descriptor has a getter** that revives the snapshot (memoized per snapshot in `Ai._reviveError`), and `el.error` revives it in local mode too, so the element still exposes `Error` instances to `el.error` and `bind()` consumers in both modes.
 - **Remote `send()` omits unset options with conditional spreads** (mirroring the local path). Never substitute `null`: `AiCore.send` rejects `null` for `temperature` / `maxTokens` / `maxToolRoundtrips` / `responseSchema` / `streamOptions`.
 - **`undefined`-valued properties are omitted, everything else is left for the wire validator** ([src/omitUndefinedProperties.ts](src/omitUndefinedProperties.ts)). `cloneMessage` applies it to parts / tool calls / `providerHints`, the remote `messages` setter sends `value.map(cloneMessage)`, and remote `send()` applies it to the prompt, tools, `toolChoice` and `responseSchema`. It must not coerce `Date` / `NaN` / class instances — that would reintroduce the silent reshaping 0.10 removed.

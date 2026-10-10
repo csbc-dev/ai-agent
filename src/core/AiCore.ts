@@ -164,13 +164,48 @@ export function inProcessErrorStack(snapshot: object): string | undefined {
  */
 function toOriginalError(source: unknown, narrowed: AiHttpError | Error | null): Error | null {
   if (narrowed === null || narrowed instanceof Error) return narrowed;
-  const error = new Error(`HTTP ${narrowed.status}${narrowed.statusText ? ` ${narrowed.statusText}` : ""}`);
+  const error = new Error(httpErrorMessage(narrowed));
   error.name = "AiHttpError";
   // `lib` is ES2020, which has no `ErrorOptions`; define `cause` the way the
   // ES2022 `Error(message, { cause })` constructor does — an own,
   // non-enumerable, writable, configurable property.
   Object.defineProperty(error, "cause", { value: source, writable: true, enumerable: false, configurable: true });
   return error;
+}
+
+/** `HTTP <status> <statusText>`, or `HTTP <status>` when `statusText` is empty. */
+function httpErrorMessage(error: AiHttpError): string {
+  return `HTTP ${error.status}${error.statusText ? ` ${error.statusText}` : ""}`;
+}
+
+/**
+ * The text a failed tool call reports: the `error` of the tool message
+ * `{ "error": <text> }` the model receives, and of the
+ * `ai-agent:tool-call-completed` detail. It follows `narrowError`, the rule
+ * `error` / `originalError` apply to a value thrown out of `send()` itself,
+ * so a thrown value reads the same in both places:
+ *
+ * - an `Error` → its `message` (a non-string one is coerced as in
+ *   `serializeError`; one that cannot be read gives
+ *   `UNSTRINGIFIABLE_THROWN_VALUE`);
+ * - an HTTP-shaped object (finite numeric `status` plus `statusText`, e.g. a
+ *   thrown `Response`) → `HTTP <status> <statusText>`, the message of the
+ *   `originalError` the Core builds for it;
+ * - any other object with a string `message` (a plain `{ code, message }`) →
+ *   that `message`, instead of `"[object Object]"`;
+ * - anything else → `String(value)`, or `UNSTRINGIFIABLE_THROWN_VALUE` when
+ *   that throws. `null` / `undefined`, which `narrowError` maps to "no
+ *   error", give `"null"` / `"undefined"`: the tool call still failed.
+ *
+ * Never throws. It runs in the tool call's `catch`; an exception there would
+ * reject the round's `Promise.all`, so the failure would end `send()` on
+ * `error` instead of reaching the model as the tool's answer.
+ */
+function toolFailureMessage(thrown: unknown): string {
+  const narrowed = narrowError(thrown);
+  if (narrowed === null) return String(thrown);
+  if (narrowed instanceof Error) return serializeError(narrowed).message;
+  return httpErrorMessage(narrowed);
 }
 
 /**
@@ -700,7 +735,9 @@ export class AiCore extends EventTarget {
             }));
             return { toolCallId: call.id, content };
           } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : String(err);
+            // The model gets the failure as this tool's answer — never as a
+            // rejection of the round (see toolFailureMessage).
+            const message = toolFailureMessage(err);
             this._target.dispatchEvent(new CustomEvent("ai-agent:tool-call-completed", {
               detail: { toolCall: { ...call }, error: message },
               bubbles: true,
