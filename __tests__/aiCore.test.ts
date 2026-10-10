@@ -1422,6 +1422,156 @@ describe("AiCore", () => {
     });
   });
 
+  // originalError: the exception behind `error`, kept in-process for server-side
+  // logging. Not declared in wcBindable, so it never reaches the remote wire
+  // (see aiRemoteIntegration.test.ts for the real-proxy side).
+  describe("originalError", () => {
+    async function failWith(thrown: unknown, core = new AiCore()): Promise<AiCore> {
+      fetchSpy.mockRejectedValueOnce(thrown);
+      core.provider = "openai";
+      await expect(core.send("Hello", { model: "gpt-4o", stream: false })).resolves.toBeNull();
+      return core;
+    }
+
+    it("初期状態はnullで、wcBindableには宣言されない", () => {
+      const core = new AiCore();
+      expect(core.originalError).toBeNull();
+      expect(JSON.stringify(AiCore.wcBindable)).not.toContain("originalError");
+    });
+
+    it("throwされたErrorはそのインスタンスのまま保持され（class / stack / cause / 独自フィールド）、errorはそのsnapshotになる", async () => {
+      const cause = new Error("connect ECONNREFUSED 10.0.0.7:443");
+      const thrown = Object.assign(new TypeError("fetch failed"), { cause, requestId: "REQ-7f3a" });
+      const core = await failWith(thrown);
+
+      expect(core.originalError).toBe(thrown);
+      expect(core.originalError).toBeInstanceOf(TypeError);
+      expect(core.originalError!.name).toBe("TypeError");
+      expect(core.originalError!.message).toBe("fetch failed");
+      expect(core.originalError!.stack).toBe(thrown.stack);
+      expect((core.originalError as typeof thrown).cause).toBe(cause);
+      expect((core.originalError as typeof thrown).requestId).toBe("REQ-7f3a");
+      // error is still the frozen JSON-safe snapshot of the same instance.
+      expect(core.error).toStrictEqual({ name: "TypeError", message: "fetch failed", stack: thrown.stack });
+      expect(Object.isFrozen(core.error)).toBe(true);
+    });
+
+    it("ai-agent:errorより前に設定され（注入したtarget上のリスナーから読める）、次のsend開始でerrorと一緒にnullに戻る", async () => {
+      const target = new EventTarget();
+      const core = new AiCore(target);
+      const seen: Array<{ error: unknown; originalError: Error | null }> = [];
+      target.addEventListener("ai-agent:error", () => {
+        seen.push({ error: core.error, originalError: core.originalError });
+      });
+
+      const thrown = new TypeError("fetch failed");
+      await failWith(thrown, core);
+      fetchSpy.mockResolvedValueOnce(createMockResponse({ choices: [{ message: { content: "OK" } }] }));
+      await expect(core.send("Hello", { model: "gpt-4o", stream: false })).resolves.toBe("OK");
+
+      expect(seen).toHaveLength(3);
+      expect(seen[0]).toEqual({ error: null, originalError: null });
+      expect(seen[1].error).toMatchObject({ name: "TypeError", message: "fetch failed" });
+      expect(seen[1].originalError).toBe(thrown);
+      expect(seen[2]).toEqual({ error: null, originalError: null });
+      expect(core.error).toBeNull();
+      expect(core.originalError).toBeNull();
+    });
+
+    it("HTTPエラーはname \"AiHttpError\"のErrorになり、causeに応答から読んだ元の値を持つ", async () => {
+      fetchSpy.mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        statusText: "Too Many Requests",
+        headers: new Headers({ "Retry-After": "7" }),
+        body: null,
+        json: () => Promise.reject(new Error("unused")),
+        text: () => Promise.resolve("slow down"),
+      } as unknown as Response);
+      const core = new AiCore();
+      core.provider = "openai";
+      await expect(core.send("Hello", { model: "gpt-4o", stream: false })).resolves.toBeNull();
+
+      expect(core.error).toStrictEqual({ status: 429, statusText: "Too Many Requests", body: "slow down", retryAfter: 7 });
+      const original = core.originalError!;
+      expect(original).toBeInstanceOf(Error);
+      expect(original.name).toBe("AiHttpError");
+      expect(original.message).toBe("HTTP 429 Too Many Requests");
+      expect(typeof original.stack).toBe("string");
+      const cause = (original as Error & { cause?: unknown }).cause;
+      expect(cause).toStrictEqual(core.error);
+      // A separate object: rewriting the cause cannot reach the Core's `error`.
+      expect(cause).not.toBe(core.error);
+      // The same property shape as ES2022 `new Error(message, { cause })`.
+      expect(Object.getOwnPropertyDescriptor(original, "cause")).toEqual({
+        value: cause,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    });
+
+    it("throwされたResponseはcauseにそのまま残る（errorの射影が落とすheadersも含む）", async () => {
+      const thrown = new Response("upstream down", {
+        status: 503,
+        statusText: "Service Unavailable",
+        headers: { "x-request-id": "REQ-7f3a" },
+      });
+      const core = await failWith(thrown);
+
+      expect(core.error).toStrictEqual({ status: 503, statusText: "Service Unavailable", body: "" });
+      expect(core.originalError).toMatchObject({ name: "AiHttpError", message: "HTTP 503 Service Unavailable" });
+      const cause = (core.originalError as Error & { cause?: unknown }).cause;
+      expect(cause).toBe(thrown);
+      expect((cause as Response).headers.get("x-request-id")).toBe("REQ-7f3a");
+    });
+
+    it("statusTextが空のHTTPエラーはmessageを\"HTTP <status>\"にする", async () => {
+      const thrown = { status: 502, statusText: 502, body: { detail: "x" } };
+      const core = await failWith(thrown);
+
+      expect(core.error).toStrictEqual({ status: 502, statusText: "", body: "" });
+      expect(core.originalError).toMatchObject({ name: "AiHttpError", message: "HTTP 502" });
+      expect((core.originalError as Error & { cause?: unknown }).cause).toBe(thrown);
+    });
+
+    it.each([
+      ["文字列", "boom"],
+      ["statusを持たないplain object", { reason: "boom" }],
+    ])("ErrorでもHTTP形でもない値（%s）は、errorと同じname / message / stackのErrorになる", async (_label, thrown) => {
+      const core = await failWith(thrown);
+
+      const original = core.originalError!;
+      expect(original).toBeInstanceOf(Error);
+      expect(original.name).toBe("Error");
+      expect(original.message).toBe(String(thrown));
+      expect(core.error).toStrictEqual({ name: original.name, message: original.message, stack: original.stack });
+    });
+
+    it("送信前の検証エラーはoriginalErrorを変えず、abortは何も記録しない", async () => {
+      const thrown = new TypeError("fetch failed");
+      const core = await failWith(thrown);
+      expect(core.originalError).toBe(thrown);
+
+      // raiseError before the request starts: neither error nor originalError changes.
+      expect(() => core.send("", { model: "gpt-4o" })).toThrow("prompt is required");
+      expect(core.error).toMatchObject({ name: "TypeError" });
+      expect(core.originalError).toBe(thrown);
+
+      // The next send clears both at its start; the abort records nothing.
+      fetchSpy.mockImplementationOnce((_url, init) => new Promise((_resolve, reject) => {
+        (init as RequestInit).signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      }));
+      const pending = core.send("Hello", { model: "gpt-4o", stream: false });
+      core.abort();
+      await expect(pending).resolves.toBeNull();
+      expect(core.error).toBeNull();
+      expect(core.originalError).toBeNull();
+    });
+  });
+
   describe("send (ストリーミング)", () => {
     it("ストリーミングレスポンスを処理できる", async () => {
       const chunks = [

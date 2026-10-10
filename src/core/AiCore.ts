@@ -89,6 +89,41 @@ function serializeError(source: Error): AiSerializedError {
   return Object.freeze(snapshot);
 }
 
+/**
+ * Build the `Error` that `AiCore.originalError` holds next to the JSON-safe
+ * `error`. `source` is the value `_setError` received; `narrowed` is what
+ * `narrowError` made of it — the value the wire projection (`serializeError`,
+ * or the `AiHttpError` projection itself) is taken from. The result is always
+ * an `Error` (or `null`), so the getter's type describes what it holds:
+ *
+ * - `null` → `null`.
+ * - An `Error` → that instance. `narrowError` returns a thrown `Error` as-is,
+ *   class / `stack` / `cause` / extra fields intact, and builds
+ *   `new Error(String(value))` for a thrown value that is neither an `Error`
+ *   nor HTTP-shaped. Either way it is the object `error` is the snapshot of,
+ *   so `name` / `message` / `stack` agree with `error`.
+ * - An `AiHttpError` → a new `Error` named `"AiHttpError"` with the message
+ *   `HTTP <status> <statusText>` (`HTTP <status>` when `statusText` is
+ *   empty), whose `cause` is the original value: the failed response's fields
+ *   as the Core read them in `_fetchTurn`, or the `Response` / HTTP-error
+ *   class instance / plain object that was thrown, with everything the
+ *   JSON-safe projection drops (headers, url, extra fields).
+ *
+ * The result never crosses the wire (`originalError` is not declared in
+ * `wcBindable`), so unlike `error` it is neither copied nor frozen and may
+ * hold non-JSON values.
+ */
+function toOriginalError(source: unknown, narrowed: AiHttpError | Error | null): Error | null {
+  if (narrowed === null || narrowed instanceof Error) return narrowed;
+  const error = new Error(`HTTP ${narrowed.status}${narrowed.statusText ? ` ${narrowed.statusText}` : ""}`);
+  error.name = "AiHttpError";
+  // `lib` is ES2020, which has no `ErrorOptions`; define `cause` the way the
+  // ES2022 `Error(message, { cause })` constructor does — an own,
+  // non-enumerable, writable, configurable property.
+  Object.defineProperty(error, "cause", { value: source, writable: true, enumerable: false, configurable: true });
+  return error;
+}
+
 type AiCoreError = AiHttpError | AiSerializedError | null;
 
 // Accumulator for streamed tool call fragments keyed by provider-reported index.
@@ -133,6 +168,11 @@ export class AiCore extends EventTarget {
   private _loading: boolean = false;
   private _streaming: boolean = false;
   private _error: AiCoreError = null;
+  /**
+   * The exception behind `_error`, as an `Error` (see `toOriginalError`).
+   * In-process only; see `originalError`.
+   */
+  private _errorSource: Error | null = null;
   private _provider: IAiProvider | null = null;
   private _abortController: AbortController | null = null;
   private _flushScheduled: boolean = false;
@@ -155,6 +195,43 @@ export class AiCore extends EventTarget {
   get loading(): boolean { return this._loading; }
   get streaming(): boolean { return this._streaming; }
   get error(): AiCoreError { return this._error; }
+
+  /**
+   * The exception behind `error`, as the Core caught it — for server-side
+   * logging and monitoring. For a thrown `Error` (a network failure, a
+   * provider `buildRequest` throw, `maxToolRoundtrips` exceeded, …) it is
+   * that instance, with its class, `stack`, `cause` and any extra fields
+   * intact. For an HTTP failure it is an `Error` named `"AiHttpError"`
+   * (message `HTTP <status> <statusText>`) whose `cause` is the original
+   * value — the failed response's fields, or the `Response` / HTTP-error
+   * object that was thrown. For any other thrown value it is the `Error` the
+   * Core stored in its place (same `name` / `message` as `error`). See
+   * `toOriginalError`. `null` exactly when `error` is `null`.
+   *
+   * It is set before the Core dispatches `ai-agent:error`, so a listener on
+   * the Core (or on the `target` it was constructed with) can read it:
+   *
+   * ```ts
+   * core.addEventListener("ai-agent:error", () => {
+   *   if (core.originalError) log.error(core.originalError);
+   * });
+   * ```
+   *
+   * This is what a remote setup needs: a failed `send()` resolves to `null`
+   * through `RemoteShellProxy` and the failure reaches the client only as
+   * the JSON-safe `error`, so server code otherwise sees the exception
+   * nowhere. Only failures the Core records on `error` appear here: a
+   * validation rejection (`raiseError` before the request starts) leaves
+   * `error` — and this — untouched, and an abort records neither.
+   *
+   * Deliberately NOT a declared `wcBindable` property: `RemoteShellProxy`
+   * reads, forwards and accepts only what the declaration names, so this
+   * value never reaches a `sync`, an `update` or a command (`cmd
+   * originalError` is refused with `WC_BINDABLE_UNDECLARED_COMMAND`), and
+   * the declaration fingerprint is unchanged. Returned as-is, not copied — it
+   * is the exception object itself.
+   */
+  get originalError(): Error | null { return this._errorSource; }
 
   get messages(): AiMessage[] {
     return this._messages.map(cloneMessage);
@@ -262,6 +339,10 @@ export class AiCore extends EventTarget {
       // may be a `Response` / class instance / object with `undefined` keys.
       : narrowed;
     this._error = stored;
+    // The exception itself stays in-process (`originalError`, never on the
+    // wire). Set before the dispatch so an `ai-agent:error` listener can
+    // already read it, and cleared together with `error`.
+    this._errorSource = toOriginalError(error, narrowed);
     this._target.dispatchEvent(new CustomEvent("ai-agent:error", {
       detail: this._error,
       bubbles: true,

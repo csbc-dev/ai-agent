@@ -94,6 +94,18 @@ wss.on("connection", (ws) => {
     },
   });
 
+  // Log failures with the original exception — its class, stack, `cause`
+  // (e.g. the socket error behind Node's `TypeError: fetch failed`) and extra
+  // fields; for a provider HTTP error, an `AiHttpError` whose `cause` holds the
+  // status / body. The browser only receives `core.error`'s JSON-safe
+  // snapshot; `core.originalError` is not declared in wcBindable, so it is
+  // never sent. It is set before `ai-agent:error` fires, and is null when
+  // the event reports a cleared error (every send() starts by clearing it).
+  core.addEventListener("ai-agent:error", () => {
+    const err = core.originalError;
+    if (err) console.error("[ai-agent:server] request failed:", err);
+  });
+
   ws.on("close", () => {
     core.abort();    // cancel any in-flight inference
     shell.dispose(); // unbind and release the Core
