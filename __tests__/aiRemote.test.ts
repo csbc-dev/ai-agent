@@ -1151,6 +1151,30 @@ describe("Ai (remote mode)", () => {
       cleanup();
     });
 
+    it("WC_BINDABLE_ABORTEDでrejectされたsendは中断としてnullに決着し、errorを立てない", async () => {
+      const { el, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await flush();
+      await flush();
+
+      // The code a conformant proxy uses for an AckOptions.signal abort.
+      const aborted = Object.assign(new Error("This operation was aborted"), { code: "WC_BINDABLE_ABORTED" });
+      (el as any)._proxy.invokeWithOptions = () => Promise.reject(aborted);
+
+      const errors: any[] = [];
+      el.addEventListener("ai-agent:error", (e: Event) => {
+        errors.push((e as CustomEvent).detail);
+      });
+
+      el.prompt = "Hi";
+      el.setAttribute("model", "gpt-4o");
+      await expect(el.send()).resolves.toBeNull();
+      expect(errors).toEqual([]);
+      expect(el.error).toBeNull();
+
+      cleanup();
+    });
+
     it("transport failure後にloading/streamingがfalseにリセットされる", async () => {
       const { el, core, cleanup } = createRemoteAi();
       document.body.appendChild(el);
