@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { describeNonJsonValue } from "@wc-bindable/remote";
 import { AiCore, inProcessErrorStack } from "../src/core/AiCore";
+import { UNSTRINGIFIABLE_THROWN_VALUE } from "../src/narrowError";
 
 function createMockResponse(body: any, options: { status?: number; ok?: boolean } = {}): Response {
   const { status = 200, ok = true } = options;
@@ -2955,6 +2956,103 @@ describe("AiCore", () => {
       const toolMsg = core.messages.find(m => m.role === "tool")!;
       expect(toolMsg.content).toContain("handler failed");
       expect(core.error).toBeNull();
+    });
+
+    // The tool message text follows narrowError — the rule `error` applies to
+    // a value thrown out of send() itself — and the failure always goes to the
+    // model as the tool's answer, never to `error`.
+    describe("tool handlerがthrowした値はnarrowErrorと同じ規則で文字列化してtool messageに入れる", () => {
+      const revokedProxy = (): object => {
+        const { proxy, revoke } = Proxy.revocable({}, {});
+        revoke();
+        return proxy;
+      };
+      const unreadableMessage = (): Error => {
+        const error = new Error("hidden");
+        Object.defineProperty(error, "message", { get() { throw new Error("no message"); } });
+        return error;
+      };
+
+      it.each([
+        ["Error", () => new Error("handler failed"), "handler failed"],
+        ["Errorのサブクラス", () => new TypeError("bad args"), "bad args"],
+        ["messageが文字列でないError", () => Object.assign(new Error(), { message: 42 }), "42"],
+        ["messageを読めないError", unreadableMessage, UNSTRINGIFIABLE_THROWN_VALUE],
+        ["messageを持つplain object { code, message }", () => ({ code: "E_UPSTREAM", message: "upstream refused" }), "upstream refused"],
+        ["messageを持つplain object { name, message }", () => ({ name: "AccessDenied", message: "denied" }), "denied"],
+        ["status / statusTextを持つobject（thrownしたResponse相当）", () => ({ status: 404, statusText: "Not Found", body: "", message: "ignored" }), "HTTP 404 Not Found"],
+        ["statusTextが空のHTTP形object", () => ({ status: 503, statusText: "" }), "HTTP 503"],
+        ["messageを持たないplain object", () => ({ reason: "nope" }), "[object Object]"],
+        ["文字列", () => "plain string", "plain string"],
+        ["null", () => null, "null"],
+        ["undefined", () => undefined, "undefined"],
+        ["Object.create(null)", () => Object.create(null), UNSTRINGIFIABLE_THROWN_VALUE],
+        ["toStringが例外を投げるobject", () => ({ toString() { throw new Error("no string form"); } }), UNSTRINGIFIABLE_THROWN_VALUE],
+        ["revokeされたProxy", revokedProxy, UNSTRINGIFIABLE_THROWN_VALUE],
+      ])("%s", async (_label, makeThrown, expected) => {
+        fetchSpy
+          .mockResolvedValueOnce(toolCallResponse("call_1", "boom", {}))
+          .mockResolvedValueOnce(finalResponse("recovered"));
+
+        const completed: any[] = [];
+        const loading: boolean[] = [];
+        const core = new AiCore();
+        core.addEventListener("ai-agent:tool-call-completed", (e) => completed.push((e as CustomEvent).detail));
+        core.addEventListener("ai-agent:loading-changed", (e) => loading.push((e as CustomEvent).detail));
+        core.provider = "openai";
+        const result = await core.send("recover please", {
+          model: "gpt-4o",
+          stream: false,
+          tools: [{
+            name: "boom",
+            description: "",
+            parameters: {},
+            handler: async () => { throw makeThrown(); },
+          }],
+        });
+
+        // The tool message, in the existing `{ "error": <text> }` shape.
+        const toolMsg = core.messages.find(m => m.role === "tool")!;
+        expect(toolMsg).toEqual({ role: "tool", content: JSON.stringify({ error: expected }), toolCallId: "call_1" });
+        expect(completed).toHaveLength(1);
+        expect(completed[0].error).toBe(expected);
+        expect("result" in completed[0]).toBe(false);
+        // The model received it, and send() went on as usual.
+        expect(fetchSpy).toHaveBeenCalledTimes(2);
+        const second = JSON.parse((fetchSpy.mock.calls[1][1] as RequestInit).body as string);
+        expect(second.messages.at(-1)).toEqual({ role: "tool", content: JSON.stringify({ error: expected }), tool_call_id: "call_1" });
+        expect(result).toBe("recovered");
+        expect(core.messages.at(-1)).toMatchObject({ role: "assistant", content: "recovered" });
+        expect(core.error).toBeNull();
+        expect(core.originalError).toBeNull();
+        expect(core.loading).toBe(false);
+        expect(loading).toEqual([true, false]);
+      });
+
+      it("同期的にthrowするhandler（String()できない値）でもtool messageに入り、sendは続く", async () => {
+        fetchSpy
+          .mockResolvedValueOnce(toolCallResponse("call_1", "boom", {}))
+          .mockResolvedValueOnce(finalResponse("recovered"));
+
+        const core = new AiCore();
+        core.provider = "openai";
+        const result = await core.send("recover please", {
+          model: "gpt-4o",
+          stream: false,
+          tools: [{
+            name: "boom",
+            description: "",
+            parameters: {},
+            handler: () => { throw Object.create(null); },
+          }],
+        });
+
+        expect(result).toBe("recovered");
+        expect(core.messages.find(m => m.role === "tool")!.content)
+          .toBe(JSON.stringify({ error: UNSTRINGIFIABLE_THROWN_VALUE }));
+        expect(core.error).toBeNull();
+        expect(core.loading).toBe(false);
+      });
     });
 
     it("maxToolRoundtrips超過でエラーに入り履歴がロールバックされる", async () => {

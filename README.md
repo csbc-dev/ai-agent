@@ -377,10 +377,10 @@ fetch → ReadableStream → TextDecoder → SseParser → Provider.parseStreamC
 
 ## Headless Usage (Core only)
 
-`AiCore` can be used without the Shell element:
+`AiCore` can be used without the Shell element. In Node (or any runtime without a DOM), import it from `@csbc-dev/ai-agent/server`: the default entry also defines the custom elements, which extend `HTMLElement`, so loading it there throws `ReferenceError: HTMLElement is not defined`.
 
 ```typescript
-import { AiCore } from "@csbc-dev/ai-agent";
+import { AiCore } from "@csbc-dev/ai-agent/server";
 import { bind } from "@wc-bindable/core";
 
 const core = new AiCore();
@@ -414,9 +414,9 @@ The exception behind `core.error` stays available in-process as `core.originalEr
 > - **Remote mode:** `el.error.stack` — and the `stack` of the `Error` that `bind()` / framework adapters receive — is no longer the server's stack trace. It is the stack of the browser code that rebuilt the `Error`, so do not use it to locate the failure; log `core.originalError` on the server ([Logging the original exception](#logging-the-original-exception-coreoriginalerror)). `name` and `message` are unchanged. A server still running an earlier version may keep sending a `stack` field; `<ai-agent>` ignores it.
 > - **Local mode:** `el.error.stack` is unchanged — still the stack of the original exception, because the Core runs in the same page and nothing crosses a network boundary. Only the raw `event.detail` of a local element's `ai-agent:error` (the Core's snapshot) loses its `stack` field.
 >
-> This covers `error` — every failure the Core records. A remote `send()` that is *rejected* instead (the server's `AiCore.send()` refusing its arguments, see [Error contract](#error-contract)) reaches the browser as the `throw` reply `RemoteShellProxy` builds from the thrown `Error`, and in `@wc-bindable/remote` 0.10 that envelope still includes the validation error's `stack`. That envelope is built by the remote layer, not by this package.
+> This covers `error` — every failure the Core records. A remote `send()` that is *rejected* instead (the server's `AiCore.send()` refusing its arguments, see [Error contract](#error-contract)), and a refused `provider` / `messages` assignment, reach the browser as the `throw` reply `RemoteShellProxy` builds from the thrown `Error`. That envelope is built by the remote layer, and in `@wc-bindable/remote` 0.10 it carries the error's `stack` and its `cause` chain ([wc-bindable-protocol#38](https://github.com/wc-bindable-protocol/wc-bindable-protocol/issues/38)). Wrap the server's transport with [`withoutThrowInternals`](#keeping-server-stack-traces-out-of-throw-replies-withoutthrowinternals) from `@csbc-dev/ai-agent/server` to keep both on the server: the browser's rejection then carries the server's `name`, `message` and `code`, and a `stack` of its own.
 >
-> Also changed: a thrown object that is not an `Error` and has a string `message` (and no `status` / `statusText`) now keeps that `message` — and its `name` — in `core.error`, `core.originalError` and `el.error`; it used to read `"[object Object]"`. A thrown value that cannot be converted to a string no longer makes `send()` reject with the conversion's `TypeError` and leaves `loading` stuck at `true`: it is recorded as an `Error` with the message `"<unstringifiable thrown value>"`, like any other failure.
+> Also changed: a thrown object that is not an `Error` and has a string `message` (and no `status` / `statusText`) now keeps that `message` — and its `name` — in `core.error`, `core.originalError` and `el.error`; it used to read `"[object Object]"`. A thrown value that cannot be converted to a string no longer makes `send()` reject with the conversion's `TypeError` and leaves `loading` stuck at `true`: it is recorded as an `Error` with the message `"<unstringifiable thrown value>"`, like any other failure. A tool handler that throws is reported to the model by the same rules (see [Error handling within the loop](#error-handling-within-the-loop)): the tool message `{ "error": … }` holds such an object's `message` instead of `"[object Object]"`, and a value `String()` rejects becomes `"<unstringifiable thrown value>"` there — it used to end the whole `send()` with the conversion's `TypeError` on `error` instead of reaching the model.
 
 ### Custom provider
 
@@ -506,7 +506,7 @@ Tool-use events are dispatched on the element but are **not** part of the `wc-bi
 
 ### Error handling within the loop
 
-- **Handler throws.** Captured into the tool message content as `{ error: "<message>" }` JSON. The model receives this and typically recovers on the next turn. No rejection bubbles out of `send()`.
+- **Handler throws.** Captured into the tool message content as `{ error: "<message>" }` JSON. The model receives this and typically recovers on the next turn. No rejection bubbles out of `send()`, and `el.error` is not set, whatever the handler throws. `<message>` follows the rules `error` applies to a failure of `send()` itself ([Headless Usage](#headless-usage-core-only)): an `Error`'s `message`; `HTTP <status> <statusText>` for a value with a finite numeric `status` and a `statusText` (a thrown `Response`, …); the `message` of any other object that has a string one (a plain `{ code, message }`); otherwise `String(value)`, or `"<unstringifiable thrown value>"` when `String()` throws. The `error` of the `ai-agent:tool-call-completed` detail is the same string.
 - **Unknown tool name.** Same treatment — tool message carries an `error` payload, the loop continues.
 - **`maxToolRoundtrips` exceeded.** `send()` resolves to `null`, `el.error` is set to an `Error`, and the messages pushed by this call are rolled back. Subsequent calls start fresh.
 - **Abort.** `abort()` during a tool handler await or between turns rolls back this send's messages cleanly.
@@ -1106,20 +1106,26 @@ Local mode ignores this flag entirely (the Core uses the credentials directly wi
 
 ### Server setup
 
-`@csbc-dev/ai-agent` does **not** ship a server helper — `AiCore` itself runs unchanged on the server. Wire it to the browser by pairing it with `RemoteShellProxy` + `WebSocketServerTransport` from `@wc-bindable/remote`.
+`AiCore` itself runs unchanged on the server. Wire it to the browser by pairing it with `RemoteShellProxy` + `WebSocketServerTransport` from `@wc-bindable/remote`.
+
+Import server code from **`@csbc-dev/ai-agent/server`**. It exports `AiCore`, the providers, the tool registry (`registerTool`, …) and the types, but not `<ai-agent>` / `<ai-message>`: the default entry defines those custom elements, which extend `HTMLElement`, so loading it in Node throws `ReferenceError: HTMLElement is not defined`. The one server-only addition is [`withoutThrowInternals`](#keeping-server-stack-traces-out-of-throw-replies-withoutthrowinternals), a transport wrapper that keeps the server's stack traces out of the browser.
 
 #### Minimal example (Node + `ws`)
 
 ```ts
 import { WebSocketServer } from "ws";
 import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote";
-import { AiCore } from "@csbc-dev/ai-agent";
+import { AiCore, withoutThrowInternals } from "@csbc-dev/ai-agent/server";
 
 const wss = new WebSocketServer({ port: 8080, path: "/ai-agent" });
 
 wss.on("connection", (ws) => {
   const core = new AiCore();
-  const transport = new WebSocketServerTransport(ws);
+  // Keep the server's stack / cause out of `throw` replies; log them here
+  // instead. Not needed once @wc-bindable/remote fixes wc-bindable-protocol#38.
+  const transport = withoutThrowInternals(new WebSocketServerTransport(ws), {
+    onThrow: (error) => console.error("call failed:", error),
+  });
   const shell = new RemoteShellProxy(core, transport);
 
   // Log failures with the original exception (class, stack, cause). The
@@ -1152,6 +1158,27 @@ Point the browser at `wss://<host>:8080/ai-agent` via `remoteCoreUrl`. Instantia
 >   logger: { warn: (m, ...x) => log.warn(m, ...x), error: (m, ...x) => log.error(m, ...x) },
 > });
 > ```
+
+#### Keeping server stack traces out of `throw` replies (`withoutThrowInternals`)
+
+```ts
+import { withoutThrowInternals } from "@csbc-dev/ai-agent/server";
+
+function withoutThrowInternals(
+  transport: ServerTransport,                       // from @wc-bindable/remote
+  options?: { onThrow?: (error: unknown) => void },
+): ServerTransport;
+```
+
+When a call from the browser fails on the server, `RemoteShellProxy` answers it with a `throw` reply. For `AiCore` that is a `send()` its validation refuses (a missing `model`, an empty prompt, an invalid option, …) and a refused `provider` / `messages` assignment (`<ai-agent>` sets both with an ack). In `@wc-bindable/remote` 0.10 that reply carries the thrown error's `stack` and its whole `cause` chain, each nested `Error` with its own `stack`, and the shell has no option to leave them out ([wc-bindable-protocol#38](https://github.com/wc-bindable-protocol/wc-bindable-protocol/issues/38)). The browser receives the server's file paths and module layout — the client proxy even makes the server's stack the `stack` of the `Error` that `send()` rejects with — although [SPEC-extensions.md § Error envelope](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/SPEC-extensions.md#error-envelope) says producers SHOULD omit both on an untrusted boundary.
+
+Wrap the transport you hand to `RemoteShellProxy`, as in the [minimal example](#minimal-example-node--ws) and the [example server](examples/remote/server/server.js):
+
+- **Only `throw` replies change.** Each is sent with a copy of its `error` without `stack` and `cause`; `name`, `message` and `code` are kept, so the browser's rejection reads the same and keeps its `code`. `sync` / `update` / `return` pass through unchanged — `core.error` is already a `{ name, message }` snapshot.
+- **`onThrow` gets what the browser no longer does.** It is called with the reply's `error` before it is stripped: the envelope `RemoteShellProxy` built (`name`, `message`, and `stack` / `cause` / `code` when present), not the thrown value itself. If it throws, the reply is still sent.
+- **Nothing else is touched.** The thrown error and `core.originalError` keep their stack, and a local `<ai-agent>`, whose Core runs in the page, never goes through it. `onMessage` / `onClose` / `dispose` are forwarded to the wrapped transport.
+
+It is a stopgap: once `@wc-bindable/remote` leaves `stack` / `cause` off the wire itself (wc-bindable-protocol#38), the wrapper has nothing left to remove and can be dropped. Failures the Core records on `error` do not depend on it; log those from [`core.originalError`](#logging-the-original-exception-coreoriginalerror).
 
 ##### Pooling and reuse on edge runtimes
 
@@ -1200,7 +1227,7 @@ wss.on("connection", (ws) => {
   | `null` | `null` |
 
 - **When it changes.** It is set together with `error`, **before** the Core dispatches `ai-agent:error`, so a listener on the Core (or on the `target` you constructed it with) can read it. It is `null` whenever `error` is, including when the next `send()` clears both at its start.
-- **What it covers.** Only failures the Core records on `error` appear here. A validation rejection thrown before the request starts (a missing `model`, an empty prompt, …) does not change `error`, so it does not change `originalError` either. In remote mode that rejection reaches the browser as the `send()` rejection. An abort records nothing.
+- **What it covers.** Only failures the Core records on `error` appear here. A validation rejection thrown before the request starts (a missing `model`, an empty prompt, …) does not change `error`, so it does not change `originalError` either. In remote mode that rejection reaches the browser as the `send()` rejection; to log it on the server, use the `onThrow` of [`withoutThrowInternals`](#keeping-server-stack-traces-out-of-throw-replies-withoutthrowinternals). An abort records nothing.
 - **It never crosses the wire.** It is not declared in `AiCore.wcBindable`. `RemoteShellProxy` reads, forwards and accepts only declared names, so this value is never sent in a `sync` or an `update`. A client cannot invoke or set it: a hand-written `cmd originalError` is refused with `WC_BINDABLE_UNDECLARED_COMMAND`, and a `set` with `WC_BINDABLE_UNDECLARED_INPUT`. The declaration fingerprint is unchanged. Do not add it to the declaration. An `Error` is not a JSON value, so `RemoteShellProxy` would drop its updates and report it in `getterFailures`.
 - It is returned as is, not copied. It is the exception object itself.
 
@@ -1229,7 +1256,7 @@ Also consider pinning `model` / `provider` / `maxTokens` server-side when the br
 When `<ai-agent>` runs in remote mode, handler functions in `el.tools` are stripped before serialization (functions are not JSON-encodable). The server resolves handlers by name from a process-wide registry populated via `registerTool()`:
 
 ```ts
-import { registerTool } from "@csbc-dev/ai-agent";
+import { registerTool } from "@csbc-dev/ai-agent/server";
 
 registerTool("get_weather", async ({ location }) => {
   // Runs server-side: full access to secrets, database connections, private APIs.
@@ -1282,6 +1309,7 @@ A public WebSocket endpoint that dispenses LLM tokens is a direct cost vector. P
 ```ts
 import { createAuthenticatedWSS } from "@wc-bindable/auth0/server";
 import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote";
+import { withoutThrowInternals } from "@csbc-dev/ai-agent/server";
 
 createAuthenticatedWSS({
   auth0Domain: "example.auth0.com",
@@ -1289,7 +1317,9 @@ createAuthenticatedWSS({
   allowedOrigins: ["https://app.example.com"],
   createCores: (user, ws) => {
     const core = new ServerAiCore();  // user identity / quotas can be captured in closure
-    const transport = new WebSocketServerTransport(ws);
+    const transport = withoutThrowInternals(new WebSocketServerTransport(ws), {
+      onThrow: (error) => console.error("call failed:", error),
+    });
     const shell = new RemoteShellProxy(core, transport);
     ws.on("close", () => { core.abort(); shell.dispose(); });
     return { core };
@@ -1337,8 +1367,11 @@ import type {
   AiContent, AiContentPart, AiContentTextPart, AiContentImagePart,
 } from "@csbc-dev/ai-agent";
 
-// Runtime registry for remote-mode tool handler resolution
-import { registerTool, unregisterTool } from "@csbc-dev/ai-agent";
+// Server code (Node): the same runtime API and types without the elements —
+// the registry for remote-mode tool handler resolution, and the transport
+// wrapper that keeps server stack traces out of `throw` replies.
+import { registerTool, unregisterTool, withoutThrowInternals } from "@csbc-dev/ai-agent/server";
+import type { WithoutThrowInternalsOptions } from "@csbc-dev/ai-agent/server";
 ```
 
 ```typescript

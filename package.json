@@ -10,6 +10,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
     "./auto": {
       "types": "./src/auto/auto.d.ts",
       "default": "./src/auto/auto.min.js"

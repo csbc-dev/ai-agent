@@ -5,12 +5,15 @@
 // (client) <-> RemoteShellProxy (server). The provider API key lives only
 // in this process's environment and never reaches the browser.
 //
-// `@csbc-dev/ai-agent` ships no server helper — `AiCore` itself runs
-// unchanged on the server; the only glue is RemoteShellProxy +
-// WebSocketServerTransport from `@wc-bindable/remote`.
+// `AiCore` itself runs unchanged on the server; the glue is RemoteShellProxy +
+// WebSocketServerTransport from `@wc-bindable/remote`, plus
+// `withoutThrowInternals` so that no server stack trace reaches the browser.
+// Server code imports from `@csbc-dev/ai-agent/server`: the default entry
+// also defines the custom elements, which extend `HTMLElement` and cannot
+// load in Node.
 import { WebSocketServer } from "ws";
 import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote";
-import { AiCore } from "@csbc-dev/ai-agent";
+import { AiCore, withoutThrowInternals } from "@csbc-dev/ai-agent/server";
 
 const port = Number(process.env.PORT ?? 8080);
 const provider = process.env.AI_PROVIDER || "openai";
@@ -76,7 +79,17 @@ wss.on("connection", (ws) => {
   const core = new ServerAiCore();
   core.provider = provider;
 
-  const transport = new WebSocketServerTransport(ws);
+  // `@wc-bindable/remote` 0.10's RemoteShellProxy puts the server's `stack`
+  // and `cause` chain on every `throw` reply — a send() the server-side
+  // AiCore refuses (missing model, empty prompt, …) or a refused `provider` /
+  // `messages` assignment — and has no option to leave them out
+  // (wc-bindable-protocol#38). `withoutThrowInternals` removes both before
+  // the reply goes out; `name`, `message` and `code` still reach the browser.
+  // `onThrow` gets the reply's error before that, so the stack stays in the
+  // server log. Drop the wrapper once upstream fixes #38.
+  const transport = withoutThrowInternals(new WebSocketServerTransport(ws), {
+    onThrow: (error) => console.error("[ai-agent:server] call failed:", error),
+  });
   // `logger` (a @wc-bindable/remote option) routes the shell's diagnostics —
   // dropped set/cmd frames, getter failures, send failures, and (since 0.10)
   // property updates dropped because a value is not a strict JsonValue —
