@@ -404,6 +404,8 @@ unbind();
 
 `core.error` is `AiHttpError | AiSerializedError | null`. A non-HTTP failure (network error, `maxToolRoundtrips` exceeded, a provider `buildRequest` throw, …) is stored as a frozen plain object `{ name, message, stack? }` — **not** an `Error` instance — so the Core's state can cross `@wc-bindable/remote` (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). Branch on `"status" in error` (HTTP) and `error.name` / `error.message`, not on `instanceof Error`. The original `name` (`"TypeError"`, `"SyntaxError"`, …) is preserved. An HTTP failure is likewise always a fresh plain `AiHttpError` `{ status, statusText, body, retryAfter? }`: a thrown value that is not an `Error` but carries a finite numeric `status` and a `statusText` — a `Response`, an HTTP-error class that does not extend `Error`, a custom provider's object — is projected onto those fields (a non-string `statusText` / `body` becomes `""`, so a `Response`'s unread body stream is not kept; `retryAfter` is kept only as a non-negative number; everything else is dropped) instead of being stored as is.
 
+The exception behind `core.error` stays available in-process as `core.originalError` (`Error | null`): the thrown `Error` instance itself (class, `stack`, `cause`, extra fields), or for an HTTP failure an `Error` named `"AiHttpError"` whose `cause` is the original value. It is set before `ai-agent:error` fires and is `null` whenever `error` is. It is not part of the bindable surface. See [Logging the original exception](#logging-the-original-exception-coreoriginalerror).
+
 > **Breaking change (`@wc-bindable` 0.10 upgrade).** `AiCore.error` and the `detail` of the Core's `ai-agent:error` event used to be an `Error` (an internal subclass carrying `toJSON`). They are now the plain `AiSerializedError` snapshot, because `@wc-bindable/remote` 0.10 drops any property value that is not a strict `JsonValue` — with the old shape a remote client's `error` stayed `null` for every non-HTTP failure. The element surface is unchanged: `el.error` and values delivered by `bind()` / framework adapters on `<ai-agent>` are still `Error` instances in local and remote mode. The one element-level difference is a raw `addEventListener("ai-agent:error", …)` on a **local-mode** element, whose `event.detail` is now the plain snapshot (it is dispatched by the Core); read `el.error` there if you need the `Error`.
 
 ### Custom provider
@@ -831,6 +833,8 @@ static wcBindable = {
 
 `AiCore.wcBindable` itself declares no getters: on a server, `RemoteShellProxy` builds its `update` messages from the Core's declaration, and those must carry the JSON-safe snapshot.
 
+`AiCore.originalError` (the exception behind `error`, for server-side logging) is deliberately **not** declared, so it is never bound, synced or sent — see [Logging the original exception](#logging-the-original-exception-coreoriginalerror).
+
 ## Framework Integration
 
 Since `<ai-agent>` is CSBC + `wc-bindable-protocol`, it works with any framework through thin adapters from `@wc-bindable/*`.
@@ -1020,7 +1024,7 @@ Remote-mode failures are exposed through the same `ai-agent:error` event and `el
 
 Any other `send()` failure is re-thrown, matching the local-mode contract: errors thrown by the server's `AiCore.send()` before it dispatches (validation such as a missing `model`), a non-JSON argument (`"WC_BINDABLE_INVALID_JSON_VALUE"`, see below) and `"WC_BINDABLE_PROTOCOL_ERROR"` — client and server use different protocol versions (or a wire bug), which retrying cannot fix. A call reported as `"WC_BINDABLE_ABORTED"` resolves to `null` without an error, like any abort.
 
-Failures the server's `AiCore` records after dispatch (provider HTTP 4xx/5xx, network failures, `maxToolRoundtrips` exceeded, unparseable responses, …) behave as in local mode: `el.send()` resolves to `null` and `el.error` is populated. The Core holds non-HTTP failures as a plain `{ name, message, stack? }` snapshot (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)), and `<ai-agent>` revives it into an `Error` — both for a live update and for the initial sync of a Core that already holds an error.
+Failures the server's `AiCore` records after dispatch (provider HTTP 4xx/5xx, network failures, `maxToolRoundtrips` exceeded, unparseable responses, …) behave as in local mode: `el.send()` resolves to `null` and `el.error` is populated. The Core holds non-HTTP failures as a plain `{ name, message, stack? }` snapshot (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)), and `<ai-agent>` revives it into an `Error` — both for a live update and for the initial sync of a Core that already holds an error. The exception itself (its `cause`, extra fields, class) stays on the server as `core.originalError` — see [Logging the original exception](#logging-the-original-exception-coreoriginalerror).
 
 ### Values sent over the wire (`JsonValue`)
 
@@ -1030,7 +1034,7 @@ What `<ai-agent>` and `AiCore` handle for you:
 
 - **Unset options are omitted.** `send()` puts only the options you actually set (`temperature`, `max-tokens`, `tools`, `toolChoice`, `maxToolRoundtrips`, `responseSchema`, `responseSchemaName`, `stream-options`) into the `send` command, exactly like local mode.
 - **`undefined`-valued properties mean "absent".** In the prompt parts, tool declarations (whose `handler` is stripped as well), `toolChoice`, `responseSchema` and `el.messages = [...]`, a property whose value is `undefined` (`{ type: "image", url, mediaType: undefined }`, `toolCalls: undefined`, …) is omitted before sending — the meaning it already has in local mode. `AiCore` applies the same rule to the history it stores, so server code that assigns `core.messages` or calls `core.send()` with such fields still syncs to the browser.
-- **Core state is JSON-safe.** `AiCore.error` is a plain `AiHttpError` (projected even when the failure was thrown as a `Response` or a class instance — see [Headless Usage](#headless-usage-core-only)) or a frozen `AiSerializedError` (`{ name, message, stack? }`), never an `Error` instance; `<ai-agent>` presents the latter as an `Error` (see [Error contract](#error-contract)).
+- **Core state is JSON-safe.** `AiCore.error` is a plain `AiHttpError` (projected even when the failure was thrown as a `Response` or a class instance — see [Headless Usage](#headless-usage-core-only)) or a frozen `AiSerializedError` (`{ name, message, stack? }`), never an `Error` instance; `<ai-agent>` presents the latter as an `Error` (see [Error contract](#error-contract)). The exception itself stays on the server as `core.originalError`, which is not declared and never sent.
 
 What stays your responsibility: put only JSON data into `el.prompt`, `el.messages`, `el.tools` (`parameters`), `el.toolChoice` and `el.responseSchema` — convert `Date`s to ISO strings, and unwrap reactive-library values that carry accessors or symbol keys (MobX `toJS()`, Vue `toRaw()`, Solid `unwrap()`). Anything else fails before it reaches the network:
 
@@ -1107,6 +1111,13 @@ wss.on("connection", (ws) => {
   const transport = new WebSocketServerTransport(ws);
   const shell = new RemoteShellProxy(core, transport);
 
+  // Log failures with the original exception (class, stack, cause). The
+  // browser only receives `core.error`'s JSON-safe snapshot;
+  // `core.originalError` is not part of the wire contract and stays here.
+  core.addEventListener("ai-agent:error", () => {
+    if (core.originalError) console.error(core.originalError);
+  });
+
   ws.on("close", () => {
     core.abort();      // cancel any in-flight inference
     shell.dispose();   // unbind and release the Core
@@ -1142,6 +1153,45 @@ On platforms where cold start on `new AiCore()` is a real cost (CF Workers, Verc
 After (1)–(3), `content` / `usage` / `loading` / `streaming` / `error` are observable state, not hidden machinery; the next `send()` clears them at turn start (`_setLoading(true); _setStreaming(false); _setError(null); _setUsage(null);`) so stale values do not leak into the next request's event stream. **What you must not reuse**: anything that captured the previous connection's user in a closure (tool handlers, custom provider instances, `EventTarget` listeners attached to the Core by the previous session's code). The process-wide `registerTool()` map survives — that is by design for user-agnostic tools, so pool cleanup must not blanket-clear it.
 
 For WebSocket servers, the simpler and safer default is a fresh `AiCore` per `connection` event. Pool only when profiling actually shows construction as the bottleneck.
+
+#### Logging the original exception (`core.originalError`)
+
+`core.error` is what the browser receives, so it is always JSON-safe: a plain `AiHttpError` or a frozen `{ name, message, stack? }` snapshot (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). It has no class, no `cause` and no extra fields. To log or monitor the failure itself on the server, read **`core.originalError`**:
+
+```ts
+class AiCore extends EventTarget {
+  get error(): AiHttpError | AiSerializedError | null; // declared in wcBindable — sent to the browser
+  get originalError(): Error | null;                    // NOT declared — stays in this process
+}
+```
+
+In a remote setup this is the only place the exception is available. A failed `send()` resolves to `null` and the failure goes to the browser only as the `error` update, so your server code never sees it otherwise. Read it in an `ai-agent:error` listener on the Core, as in the [minimal example](#minimal-example-node--ws). The [example server](examples/remote/server/server.js) does the same:
+
+```js
+wss.on("connection", (ws) => {
+  const core = new ServerAiCore();
+  core.provider = provider;
+  // ...
+  core.addEventListener("ai-agent:error", () => {
+    const err = core.originalError;
+    if (err) console.error("[ai-agent:server] request failed:", err); // or log.error({ err }, "request failed")
+  });
+});
+```
+
+- **What it holds.** It is always an `Error` (or `null`):
+
+  | `core.error` | `core.originalError` |
+  |---|---|
+  | snapshot of a thrown `Error` (network failure, provider `buildRequest` throw, unparseable response, `maxToolRoundtrips` exceeded, …) | that `Error` instance itself — its class, `stack`, `cause` and any extra fields intact (for example Node's `TypeError: fetch failed` with the socket error in `cause`) |
+  | `AiHttpError` (a provider 4xx / 5xx, or a thrown `Response` / HTTP-error object) | `Error` named `"AiHttpError"` with the message `HTTP <status> <statusText>` (`HTTP <status>` when `statusText` is empty). Its `cause` is the original value: the response fields as the Core read them (`{ status, statusText, body, retryAfter? }`), or the thrown `Response` / object, including what the projection drops (headers, URL, extra fields) |
+  | snapshot of any other thrown value (a string, a plain object without `status` / `statusText`, …) | the `Error` the Core built in its place: the same `name` / `message` / `stack` as `core.error` |
+  | `null` | `null` |
+
+- **When it changes.** It is set together with `error`, **before** the Core dispatches `ai-agent:error`, so a listener on the Core (or on the `target` you constructed it with) can read it. It is `null` whenever `error` is, including when the next `send()` clears both at its start.
+- **What it covers.** Only failures the Core records on `error` appear here. A validation rejection thrown before the request starts (a missing `model`, an empty prompt, …) does not change `error`, so it does not change `originalError` either. In remote mode that rejection reaches the browser as the `send()` rejection. An abort records nothing.
+- **It never crosses the wire.** It is not declared in `AiCore.wcBindable`. `RemoteShellProxy` reads, forwards and accepts only declared names, so this value is never sent in a `sync` or an `update`. A client cannot invoke or set it: a hand-written `cmd originalError` is refused with `WC_BINDABLE_UNDECLARED_COMMAND`, and a `set` with `WC_BINDABLE_UNDECLARED_INPUT`. The declaration fingerprint is unchanged. Do not add it to the declaration. An `Error` is not a JSON value, so `RemoteShellProxy` would drop its updates and report it in `getterFailures`.
+- It is returned as is, not copied. It is the exception object itself.
 
 #### Injecting the provider API key server-side
 
@@ -1347,6 +1397,12 @@ interface AiAgentCoreValues {   // values of AiCore
 interface AiAgentValues extends AiAgentCoreValues {   // values of <ai-agent>
   error: AiHttpError | Error | null;   // the element revives AiSerializedError into an Error
   trigger: boolean;
+}
+
+// The Core's two error accessors (excerpt of the AiCore class).
+class AiCore extends EventTarget {
+  get error(): AiHttpError | AiSerializedError | null; // bindable; what the browser receives
+  get originalError(): Error | null;                    // not bindable; the exception itself, in-process only
 }
 ```
 

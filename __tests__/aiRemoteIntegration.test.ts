@@ -1774,4 +1774,305 @@ describe("Remote integration", () => {
       cleanup();
     });
   });
+
+  // -----------------------------------------------------------------------
+  // AiCore.originalError — the original exception stays on the server
+  // -----------------------------------------------------------------------
+  describe("AiCore.originalError — 元の例外はサーバーに留まる", () => {
+    const DECLARED = AiCore.wcBindable.properties.map(p => p.name);
+
+    /**
+     * Shaped like the error Node's fetch (undici) throws: a `TypeError` with a
+     * `cause` carrying an internal address, plus an extra field. Only the
+     * instance has the cause / the field, so finding them on the wire would
+     * mean the instance (not the snapshot) was sent.
+     */
+    function networkFailure(): TypeError & { cause: Error; requestId: string } {
+      return Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("connect ECONNREFUSED 10.0.0.7:443"), { code: "ECONNREFUSED" }),
+        requestId: "REQ-7f3a",
+      });
+    }
+
+    /** A thrown `Response` whose header only the instance (the `cause`) keeps. */
+    function upstreamResponse(): Response {
+      return new Response("upstream down", {
+        status: 503,
+        statusText: "Service Unavailable",
+        headers: { "x-request-id": "REQ-7f3a" },
+      });
+    }
+
+    /** Record every server → client frame, as decoded off the wire. */
+    function recordServerFrames(): {
+      frames: ServerMessage[];
+      rewriteServerMessage: (msg: ServerMessage) => ServerMessage;
+    } {
+      const frames: ServerMessage[] = [];
+      return { frames, rewriteServerMessage: (msg) => { frames.push(msg); return msg; } };
+    }
+
+    /**
+     * Data only the instance carries never crosses, and property frames
+     * carry declared names only. (`error` itself — the JSON-safe snapshot,
+     * including its `stack` — is the declared wire value and is checked by
+     * each test separately.)
+     */
+    function expectNoInstanceOnlyData(frames: ServerMessage[]): void {
+      const text = JSON.stringify(frames);
+      for (const leaked of ["ECONNREFUSED", "10.0.0.7", "REQ-7f3a", "AiHttpError", "\"cause\""]) {
+        expect(text).not.toContain(leaked);
+      }
+      for (const m of frames) {
+        if (m.type === "sync") {
+          for (const name of Object.keys(m.values)) expect(DECLARED).toContain(name);
+          expect(m.getterFailures).toBeUndefined();
+        } else if (m.type === "update") {
+          expect(DECLARED).toContain(m.name);
+        }
+      }
+    }
+
+    function errorUpdates(frames: ServerMessage[]): unknown[] {
+      return frames
+        .filter((m): m is Extract<ServerMessage, { type: "update" }> =>
+          m.type === "update" && m.name === "error" && m.value != null)
+        .map(m => m.value);
+    }
+
+    it("サーバーのコードはCoreのai-agent:errorで元の例外（name / message / stack / cause）を読め、sync / update / throwのどれにも載らない", async () => {
+      const original = networkFailure();
+      fetchSpy.mockRejectedValueOnce(original);
+
+      const { frames, rewriteServerMessage } = recordServerFrames();
+      const { el, core, shellWarnings, cleanup } = createRemoteAi({ rewriteServerMessage });
+      // The README recipe: listen on the Core's own event, read the instance.
+      const logged: Array<Error | null> = [];
+      core.addEventListener("ai-agent:error", () => { logged.push(core.originalError); });
+      document.body.appendChild(el);
+      await settle();
+
+      core.provider = "openai";
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.prompt = "Hi";
+
+      await expect(el.send()).resolves.toBeNull();
+      await settle();
+
+      // Server side: the exception itself. `null` first — the send's start
+      // clears the slot before the request, and the listener sees that too.
+      expect(logged).toHaveLength(2);
+      expect(logged[0]).toBeNull();
+      expect(logged[1]).toBe(original);
+      const seen = core.originalError as ReturnType<typeof networkFailure>;
+      expect(seen).toBe(original);
+      expect(seen.name).toBe("TypeError");
+      expect(seen.message).toBe("fetch failed");
+      expect(typeof seen.stack).toBe("string");
+      expect(seen.stack).toBe(original.stack);
+      expect(seen.cause.message).toBe("connect ECONNREFUSED 10.0.0.7:443");
+      expect(seen.requestId).toBe("REQ-7f3a");
+
+      // Browser side: the Error revived from the snapshot, as before.
+      expect(el.error).toBeInstanceOf(Error);
+      expect(el.error).toMatchObject({ name: "TypeError", message: "fetch failed" });
+      expect((el.error as Error & { cause?: unknown }).cause).toBeUndefined();
+      expect((el.error as unknown as { requestId?: unknown }).requestId).toBeUndefined();
+
+      // The failed send settles with `return null`; its failure travels only
+      // as the `error` update — the unchanged { name, message, stack } snapshot.
+      expect(errorUpdates(frames)).toEqual([{ name: "TypeError", message: "fetch failed", stack: original.stack }]);
+
+      // A validation rejection afterwards is a `throw` frame. It leaves
+      // `error` / `originalError` untouched and carries nothing of the instance.
+      core.provider = null;
+      await expect(el.send()).rejects.toThrow("provider is required");
+      await settle();
+      expect(core.originalError).toBe(original);
+      const throws = frames.filter(m => m.type === "throw");
+      expect(throws).toHaveLength(1);
+      expect(JSON.stringify(throws)).not.toContain("fetch failed");
+
+      expect(frames.some(m => m.type === "sync")).toBe(true);
+      expect(JSON.stringify(frames)).not.toContain("originalError");
+      expectNoInstanceOnlyData(frames);
+      expect(shellWarnings).toEqual([]);
+
+      cleanup();
+    });
+
+    it("HTTPエラー（throwされたResponse）はname \"AiHttpError\"・causeにそのResponseで残り、wireには従来の射影だけが載る", async () => {
+      const thrown = upstreamResponse();
+      fetchSpy.mockRejectedValueOnce(thrown);
+
+      const { frames, rewriteServerMessage } = recordServerFrames();
+      const { el, core, shellWarnings, cleanup } = createRemoteAi({ rewriteServerMessage });
+      const logged: Array<Error | null> = [];
+      core.addEventListener("ai-agent:error", () => { logged.push(core.originalError); });
+      document.body.appendChild(el);
+      await settle();
+
+      core.provider = "openai";
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.prompt = "Hi";
+      await expect(el.send()).resolves.toBeNull();
+      await settle();
+
+      expect(logged).toHaveLength(2);
+      expect(logged[1]).toBe(core.originalError);
+      expect(core.originalError).toBeInstanceOf(Error);
+      expect(core.originalError).toMatchObject({ name: "AiHttpError", message: "HTTP 503 Service Unavailable" });
+      expect((core.originalError as Error & { cause?: unknown }).cause).toBe(thrown);
+
+      const projected = { status: 503, statusText: "Service Unavailable", body: "" };
+      expect(el.error).toStrictEqual(projected);
+      expect(errorUpdates(frames)).toEqual([projected]);
+      expect(JSON.stringify(frames)).not.toContain("originalError");
+      expectNoInstanceOnlyData(frames);
+      expect(shellWarnings).toEqual([]);
+
+      cleanup();
+    });
+
+    const lateJoinCases: Array<{
+      label: string;
+      thrown: () => unknown;
+      wireError: (thrown: any) => unknown;
+      expectOriginal: (original: Error | null, thrown: any) => void;
+    }> = [
+      {
+        label: "Error",
+        thrown: networkFailure,
+        wireError: (thrown: Error) => ({ name: "TypeError", message: "fetch failed", stack: thrown.stack }),
+        expectOriginal: (original, thrown) => expect(original).toBe(thrown),
+      },
+      {
+        label: "HTTPエラー",
+        thrown: upstreamResponse,
+        wireError: () => ({ status: 503, statusText: "Service Unavailable", body: "" }),
+        expectOriginal: (original, thrown) => {
+          expect(original).toMatchObject({ name: "AiHttpError" });
+          expect((original as Error & { cause?: unknown }).cause).toBe(thrown);
+        },
+      },
+    ];
+
+    for (const { label, thrown: makeThrown, wireError, expectOriginal } of lateJoinCases) {
+      it(`失敗の後に接続した2本目のクライアントのsyncにも載らない（${label}）`, async () => {
+        const thrown = makeThrown();
+        fetchSpy.mockRejectedValueOnce(thrown);
+
+        const first = createRemoteAi();
+        document.body.appendChild(first.el);
+        await settle();
+        first.core.provider = "openai";
+        first.el.setAttribute("model", "gpt-4o");
+        first.el.stream = false;
+        first.el.prompt = "Hi";
+        await expect(first.el.send()).resolves.toBeNull();
+        await settle();
+        expectOriginal(first.core.originalError, thrown);
+
+        // A second connection to the same Core: its first frame is the sync,
+        // which reads `core.error` directly.
+        const { frames, rewriteServerMessage } = recordServerFrames();
+        const wire2 = createMockTransportPair({ rewriteServerMessage });
+        const shellWarnings2: string[] = [];
+        const shell2 = new RemoteShellProxy(first.core, wire2.server, {
+          logger: {
+            warn: (msg: string) => { shellWarnings2.push(msg); },
+            error: (msg: string) => { shellWarnings2.push(msg); },
+          },
+        });
+        const el2 = document.createElement("ai-agent") as Ai;
+        (el2 as any)._connectRemote(wire2.client);
+        document.body.appendChild(el2);
+        await settle();
+
+        const sync = frames.find((m): m is Extract<ServerMessage, { type: "sync" }> => m.type === "sync");
+        expect(sync).toBeDefined();
+        expect(sync!.values.error).toEqual(wireError(thrown));
+        expect(JSON.stringify(sync)).not.toContain("originalError");
+        expectNoInstanceOnlyData(frames);
+        expect(shellWarnings2).toEqual([]);
+        expect(el2.error).toMatchObject(wireError(thrown) as object);
+        // Still the same instance on the server.
+        expectOriginal(first.core.originalError, thrown);
+
+        shell2.dispose();
+        el2.remove();
+        first.cleanup();
+      });
+    }
+
+    it("クライアントからは取得も設定もできない: 手書きのcmd / setはWC_BINDABLE_UNDECLARED_*で拒否される", async () => {
+      const original = networkFailure();
+      fetchSpy.mockRejectedValueOnce(original);
+      const core = new AiCore();
+      core.provider = "openai";
+      await expect(core.send("Hi", { model: "gpt-4o", stream: false })).resolves.toBeNull();
+      expect(core.originalError).toBe(original);
+
+      // Hand-written frames, as a hostile client would send them.
+      const { client, server } = createMockTransportPair();
+      const shell = new RemoteShellProxy(core, server);
+      const frames: ServerMessage[] = [];
+      client.onMessage((msg) => { frames.push(msg); });
+      client.send({ type: "sync" });
+      client.send({ type: "cmd", name: "originalError", id: "probe", args: [] });
+      client.send({ type: "set", name: "originalError", value: null, id: "probe-set" });
+      await settle();
+
+      const answer = frames.find((m): m is Extract<ServerMessage, { type: "throw" }> =>
+        m.type === "throw" && m.id === "probe");
+      expect(answer?.error).toMatchObject({ code: "WC_BINDABLE_UNDECLARED_COMMAND" });
+      const setAnswer = frames.find((m): m is Extract<ServerMessage, { type: "throw" }> =>
+        m.type === "throw" && m.id === "probe-set");
+      expect(setAnswer?.error).toMatchObject({ code: "WC_BINDABLE_UNDECLARED_INPUT" });
+      // The rejections name the probe, but carry nothing of the instance.
+      expectNoInstanceOnlyData(frames);
+      expect(core.originalError).toBe(original);
+
+      shell.dispose();
+    });
+
+    it("回復（次のsendの成功）でerrorと一緒にnullに戻り、そのai-agent:errorのリスナーもnullを読む", async () => {
+      fetchSpy.mockRejectedValueOnce(networkFailure());
+      fetchSpy.mockResolvedValueOnce(jsonResponse({ choices: [{ message: { content: "recovered" } }] }));
+
+      const { frames, rewriteServerMessage } = recordServerFrames();
+      const { el, core, cleanup } = createRemoteAi({ rewriteServerMessage });
+      const logged: Array<{ error: unknown; originalError: Error | null }> = [];
+      core.addEventListener("ai-agent:error", () => {
+        logged.push({ error: core.error, originalError: core.originalError });
+      });
+      document.body.appendChild(el);
+      await settle();
+
+      core.provider = "openai";
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.prompt = "Hi";
+      await expect(el.send()).resolves.toBeNull();
+      await settle();
+      expect(core.originalError).toBeInstanceOf(TypeError);
+      expect(el.error).toBeInstanceOf(Error);
+
+      await expect(el.send()).resolves.toBe("recovered");
+      await settle();
+
+      expect(core.error).toBeNull();
+      expect(core.originalError).toBeNull();
+      expect(el.error).toBeNull();
+      // [first send's clear, the failure, second send's clear] — error and
+      // originalError always change together.
+      expect(logged.map(e => e.originalError === null)).toEqual([true, false, true]);
+      for (const e of logged) expect(e.error === null).toBe(e.originalError === null);
+      expectNoInstanceOnlyData(frames);
+
+      cleanup();
+    });
+  });
 });
