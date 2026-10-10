@@ -402,7 +402,7 @@ console.log("History:", core.messages);
 unbind();
 ```
 
-`core.error` is `AiHttpError | AiSerializedError | null`. A non-HTTP failure (network error, `maxToolRoundtrips` exceeded, a provider `buildRequest` throw, …) is stored as a frozen plain object `{ name, message, stack? }` — **not** an `Error` instance — so the Core's state can cross `@wc-bindable/remote` (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). Branch on `"status" in error` (HTTP) and `error.name` / `error.message`, not on `instanceof Error`. The original `name` (`"TypeError"`, `"SyntaxError"`, …) is preserved.
+`core.error` is `AiHttpError | AiSerializedError | null`. A non-HTTP failure (network error, `maxToolRoundtrips` exceeded, a provider `buildRequest` throw, …) is stored as a frozen plain object `{ name, message, stack? }` — **not** an `Error` instance — so the Core's state can cross `@wc-bindable/remote` (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). Branch on `"status" in error` (HTTP) and `error.name` / `error.message`, not on `instanceof Error`. The original `name` (`"TypeError"`, `"SyntaxError"`, …) is preserved. An HTTP failure is likewise always a fresh plain `AiHttpError` `{ status, statusText, body, retryAfter? }`: a thrown value that is not an `Error` but carries a finite numeric `status` and a `statusText` — a `Response`, an HTTP-error class that does not extend `Error`, a custom provider's object — is projected onto those fields (a non-string `statusText` / `body` becomes `""`, so a `Response`'s unread body stream is not kept; `retryAfter` is kept only as a non-negative number; everything else is dropped) instead of being stored as is.
 
 > **Breaking change (`@wc-bindable` 0.10 upgrade).** `AiCore.error` and the `detail` of the Core's `ai-agent:error` event used to be an `Error` (an internal subclass carrying `toJSON`). They are now the plain `AiSerializedError` snapshot, because `@wc-bindable/remote` 0.10 drops any property value that is not a strict `JsonValue` — with the old shape a remote client's `error` stayed `null` for every non-HTTP failure. The element surface is unchanged: `el.error` and values delivered by `bind()` / framework adapters on `<ai-agent>` are still `Error` instances in local and remote mode. The one element-level difference is a raw `addEventListener("ai-agent:error", …)` on a **local-mode** element, whose `event.detail` is now the plain snapshot (it is dispatched by the Core); read `el.error` there if you need the `Error`.
 
@@ -980,6 +980,27 @@ In **local mode**, the Core is created in the constructor, so setting `el.messag
 
 - Setting `el.messages = [...]` before the element is connected is a no-op (the proxy does not exist to receive the write).
 - Append the element to the DOM first, wait for the initial sync (`ai-agent:messages-changed` fires), then set imperative state. Or use the declarative DOM form (`<ai-message kind="user">…</ai-message>` children) for an initial prompt — note that those are not seeded in remote mode either; the server owns conversation state.
+- Imperative calls made right after appending, before the initial sync has arrived, are not lost: they are queued and sent in call order once the sync has been processed (see [Calls made before the initial sync](#calls-made-before-the-initial-sync)). The sync is delivered first, so `el.messages` briefly shows the server's history before such an assignment replaces it.
+
+### Calls made before the initial sync
+
+Connecting sends a `sync` request. Until the server's answer has been processed, `<ai-agent>` holds every call it would send — the `provider` attribute ack, `el.messages = [...]`, `send()`, `abort()` — and sends them in call order right after ([SPEC-extensions.md § Pre-sync call state machine](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/SPEC-extensions.md#pre-sync-call-state-machine), which makes this a MUST for the client proxy). That is `remote.preSyncBehavior: "queue"`, the default. It deliberately overrides the `@wc-bindable/remote` library default, which is still `"eager"` through 0.10 (calls written to the socket immediately; documented upstream as non-conformant), because with `"eager"` the server can act on a call the client then reports as failed:
+
+- **The element is removed before the sync arrives** (e.g. a route change right after `send()`): `send()` resolves to `null` with a disposed-proxy error, yet the server received the `send` and issued an LLM request, aborted right after.
+- **The server's declaration has another `protocol` identifier:** the client rejects with `code: "WC_BINDABLE_PROTOCOL_ERROR"`, yet the server had already applied `messages` and run the inference.
+- **The server does not advertise `setAck`** (an older `@wc-bindable/remote`): the client rejects the `provider` change, yet the server applied it. With the queue nothing is sent and the rejection carries `code: "WC_BINDABLE_SET_ACK_UNSUPPORTED"`.
+
+Against a compatible server the outcome is the same either way — `RemoteShellProxy` answers frames in order. What the queue means in practice:
+
+| | Behavior |
+|---|---|
+| Queue bound | 1 024 calls per element (the library's `maxPreSyncQueue` default); a call beyond that rejects with `code: "WC_BINDABLE_PRE_SYNC_QUEUE_FULL"`. An element issues a handful. |
+| `provider` / `messages` acks | Keep their default 30 s timeout: with no sync within 30 s they reject with a `TimeoutError` into `el.error` (a failed `provider` also makes `send()` refuse, as with any provider error). Once sent, the reply gets a fresh 30 s. |
+| `send()` | Has no timeout (`timeoutMs: 0`), so a queued `send()` waits for the sync just as it would wait for the reply. Removing the element or losing the connection settles it: `send()` resolves to `null` and `el.error` is set (transport failure). |
+| `abort()` | Queued behind a queued `send()`, so it still cancels that send on the server. |
+| Element removed before the sync | Queued calls are dropped without being sent. |
+
+To get the immediate sends of earlier versions back, set `remote: { preSyncBehavior: "eager" }` (read when an element connects). It is an escape hatch — for example for a custom server that never answers `sync` — and it brings back the three cases above. `@wc-bindable/remote` documents removing its option (queue only) in 1.0; this setting will follow.
 
 ### `remoteSettingType`
 
@@ -1005,7 +1026,7 @@ What `<ai-agent>` and `AiCore` handle for you:
 
 - **Unset options are omitted.** `send()` puts only the options you actually set (`temperature`, `max-tokens`, `tools`, `toolChoice`, `maxToolRoundtrips`, `responseSchema`, `responseSchemaName`, `stream-options`) into the `send` command, exactly like local mode.
 - **`undefined`-valued properties mean "absent".** In the prompt parts, tool declarations (whose `handler` is stripped as well), `toolChoice`, `responseSchema` and `el.messages = [...]`, a property whose value is `undefined` (`{ type: "image", url, mediaType: undefined }`, `toolCalls: undefined`, …) is omitted before sending — the meaning it already has in local mode. `AiCore` applies the same rule to the history it stores, so server code that assigns `core.messages` or calls `core.send()` with such fields still syncs to the browser.
-- **Core state is JSON-safe.** `AiCore.error` is an `AiHttpError` or a frozen `AiSerializedError` (`{ name, message, stack? }`), never an `Error` instance; `<ai-agent>` presents it as an `Error` (see [Error contract](#error-contract)).
+- **Core state is JSON-safe.** `AiCore.error` is a plain `AiHttpError` (projected even when the failure was thrown as a `Response` or a class instance — see [Headless Usage](#headless-usage-core-only)) or a frozen `AiSerializedError` (`{ name, message, stack? }`), never an `Error` instance; `<ai-agent>` presents the latter as an `Error` (see [Error contract](#error-contract)).
 
 What stays your responsibility: put only JSON data into `el.prompt`, `el.messages`, `el.tools` (`parameters`), `el.toolChoice` and `el.responseSchema` — convert `Date`s to ISO strings, and unwrap reactive-library values that carry accessors or symbol keys (MobX `toJS()`, Vue `toRaw()`, Solid `unwrap()`). Anything else fails before it reaches the network:
 
@@ -1096,7 +1117,7 @@ Point the browser at `wss://<host>:8080/ai-agent` via `remoteCoreUrl`. Instantia
 > - **Capabilities negotiation** (`setAck` / `undefinedProperties` / `getterFailures`).
 > - **Strict `JsonValue` wire values.** Both proxies validate every value they send instead of letting `JSON.stringify` reshape it — see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue). `AiCore` keeps all of its own state JSON-safe for this (including `error`), so a stock `new RemoteShellProxy(new AiCore(), transport)` needs nothing extra.
 >
-> `<ai-agent>` does **not** opt into the spec-conformant pre-sync queue: it leaves `RemoteCoreProxy`'s `preSyncBehavior` at the library default, which is still `"eager"` through 0.10. A `setWithAck` / `invoke` issued before the first sync (an early `provider` ack, a `send()` right after connect) is written to the socket immediately, behind the proxy's own sync request; since the WebSocket is FIFO and `RemoteShellProxy` handles frames in order, the server still answers the sync first. The one difference from `"queue"` is that a pre-sync `setWithAck` against a server that does not advertise `setAck` rejects when the sync response arrives rather than locally.
+> `<ai-agent>` creates its `RemoteCoreProxy` with the spec-conformant `preSyncBehavior: "queue"` rather than the library default (`"eager"` through 0.10): calls made before the first sync response are held until it has been processed — see [Calls made before the initial sync](#calls-made-before-the-initial-sync). Nothing changes on the server side.
 >
 > Both `RemoteShellProxy` (server) and `RemoteCoreProxy` (client, inside `<ai-agent>`) accept an optional `logger` so the layer's diagnostics route through your own sink — `<ai-agent>` already wires one that respects this package's dev-mode gate. On the server, pass a structured logger and optionally bound memory against slow peers:
 >
@@ -1235,6 +1256,7 @@ bootstrapAi({
     enableRemote: false,         // true で WebSocket 経由の remote Core に切り替え
     remoteSettingType: "config", // "config" | "env"
     remoteCoreUrl: "",           // "config" の時に使われる URL
+    preSyncBehavior: "queue",    // "queue" | "eager"（初回 sync 応答前の呼び出しの扱い。Remote Mode 参照）
   },
 });
 ```
@@ -1452,6 +1474,7 @@ A cross-cutting summary of how each failure class surfaces, consolidated from th
 | `maxToolRoundtrips` exceeded | `el.error` | `null` | rolled back for this send() | `Error` |
 | Network failure, unparseable response, provider `buildRequest` throw | `el.error` | `null` | rolled back for this send() | `Error` (original `name` kept) |
 | Provider HTTP 4xx / 5xx | `el.error` | `null` | user turn rolled back | `AiHttpError` |
+| Non-`Error` thrown with numeric `status` + `statusText` (a `Response`, an HTTP-error class, …) | `el.error` | `null` | rolled back for this send() | `AiHttpError` (plain projection) |
 | Abort (`abort()` or new `send()`) | Neither (control signal) | `null` | rolled back | `null` (**not set**) |
 | Remote WebSocket connect / drop | `el.error` | (no in-flight send) / `null` | — | `Error` |
 | Remote transport failure during `send()` (timeout, disposed proxy, raw `DOMException`) | `el.error` | `null` | rolled back | `Error` |

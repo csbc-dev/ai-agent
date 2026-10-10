@@ -1,5 +1,5 @@
 import { raiseError } from "./raiseError.js";
-import { IConfig, IWritableConfig } from "./types.js";
+import { AiPreSyncBehavior, IConfig, IWritableConfig } from "./types.js";
 
 interface IInternalConfig extends IConfig {
   autoTrigger: boolean;
@@ -12,6 +12,7 @@ interface IInternalConfig extends IConfig {
     enableRemote: boolean;
     remoteSettingType: "env" | "config";
     remoteCoreUrl: string;
+    preSyncBehavior: AiPreSyncBehavior;
   };
 }
 
@@ -43,6 +44,10 @@ function createDefaultConfig(): IInternalConfig {
       enableRemote: false,
       remoteSettingType: "config",
       remoteCoreUrl: "",
+      // Spec-conformant pre-sync queue (SPEC-extensions.md § Pre-sync call
+      // state machine), NOT the @wc-bindable/remote default ("eager"). See
+      // the comment in Ai._connectRemote.
+      preSyncBehavior: "queue",
     },
   };
 }
@@ -145,6 +150,17 @@ export function setConfig(partialConfig: IWritableConfig): void {
         raiseError(`setConfig: remote.remoteSettingType must be "env" or "config", got ${JSON.stringify(partialConfig.remote.remoteSettingType)}.`);
       }
     }
+    // Same reasoning: a typo here would otherwise reach
+    // createRemoteCoreProxy, which treats anything but "queue" as "eager" and
+    // would silently drop the spec-conformant pre-sync queue.
+    if ("preSyncBehavior" in partialConfig.remote) {
+      if (
+        partialConfig.remote.preSyncBehavior !== "queue" &&
+        partialConfig.remote.preSyncBehavior !== "eager"
+      ) {
+        raiseError(`setConfig: remote.preSyncBehavior must be "queue" or "eager", got ${JSON.stringify(partialConfig.remote.preSyncBehavior)}.`);
+      }
+    }
     Object.assign(_config.remote, partialConfig.remote);
   }
   frozenConfig = null;
@@ -170,5 +186,6 @@ export function resetConfig(): void {
   _config.remote.enableRemote = defaults.remote.enableRemote;
   _config.remote.remoteSettingType = defaults.remote.remoteSettingType;
   _config.remote.remoteCoreUrl = defaults.remote.remoteCoreUrl;
+  _config.remote.preSyncBehavior = defaults.remote.preSyncBehavior;
   frozenConfig = null;
 }

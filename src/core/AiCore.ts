@@ -257,7 +257,10 @@ export class AiCore extends EventTarget {
     const narrowed = narrowError(error);
     const stored: AiCoreError = narrowed instanceof Error
       ? serializeError(narrowed)
-      : narrowed; // null or AiHttpError (already a plain JSON-shaped object)
+      // null, or an AiHttpError that narrowError has already projected onto
+      // a fresh plain JsonValue object — never the thrown value itself, which
+      // may be a `Response` / class instance / object with `undefined` keys.
+      : narrowed;
     this._error = stored;
     this._target.dispatchEvent(new CustomEvent("ai-agent:error", {
       detail: this._error,

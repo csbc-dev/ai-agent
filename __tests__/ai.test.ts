@@ -5,7 +5,7 @@ import { AiCore } from "../src/core/AiCore";
 import { AiMessageElement } from "../src/components/AiMessage";
 import { registerComponents } from "../src/registerComponents";
 import { bootstrapAi } from "../src/bootstrapAi";
-import { config, setConfig, getConfig, getRemoteCoreUrl } from "../src/config";
+import { config, setConfig, getConfig, getRemoteCoreUrl, resetConfig } from "../src/config";
 import { raiseError } from "../src/raiseError";
 import { registerAutoTrigger, unregisterAutoTrigger } from "../src/autoTrigger";
 
@@ -141,9 +141,19 @@ describe("config", () => {
     expect(config.remote.remoteSettingType).toBe("config");
   });
 
+  it("setConfig()でremote.preSyncBehaviorのqueue/eager以外（明示的undefinedを含む）を拒否する", () => {
+    // RemoteCoreProxy treats anything but "queue" as "eager", so a typo
+    // would silently drop the spec-conformant pre-sync queue.
+    expect(() => setConfig({ remote: { preSyncBehavior: "Queue" as any } }))
+      .toThrow(/remote\.preSyncBehavior must be "queue" or "eager"/);
+    expect(() => setConfig({ remote: { preSyncBehavior: undefined } as any }))
+      .toThrow(/remote\.preSyncBehavior must be "queue" or "eager"/);
+    expect(config.remote.preSyncBehavior).toBe("queue");
+  });
+
   describe("remote", () => {
     afterEach(() => {
-      setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
+      setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "", preSyncBehavior: "queue" } });
       delete (globalThis as any).process?.env?.AI_REMOTE_CORE_URL;
     });
 
@@ -151,6 +161,18 @@ describe("config", () => {
       expect(config.remote.enableRemote).toBe(false);
       expect(config.remote.remoteSettingType).toBe("config");
       expect(config.remote.remoteCoreUrl).toBe("");
+    });
+
+    it("preSyncBehaviorの既定はspec準拠のqueueで、eagerに上書きできる", () => {
+      expect(config.remote.preSyncBehavior).toBe("queue");
+      expect(getConfig().remote.preSyncBehavior).toBe("queue");
+      setConfig({ remote: { preSyncBehavior: "eager" } });
+      expect(config.remote.preSyncBehavior).toBe("eager");
+      expect(getConfig().remote.preSyncBehavior).toBe("eager");
+      // Other remote keys are untouched by a partial update.
+      expect(config.remote.remoteSettingType).toBe("config");
+      resetConfig();
+      expect(config.remote.preSyncBehavior).toBe("queue");
     });
 
     it("setConfig()でremote設定を変更できる", () => {

@@ -1333,6 +1333,93 @@ describe("AiCore", () => {
       expect(describeNonJsonValue(core.error)).toBeNull();
       expect(details.at(-1)).toBe(core.error);
     });
+
+    describe("status/statusTextを持つ非Errorの例外はJSON-safeなAiHttpErrorに射影して保持する", () => {
+      class UpstreamHttpError {
+        status = 429;
+        statusText = "Too Many Requests";
+        body = "slow down";
+        retryAfter = 7;
+        headers = new Map([["retry-after", "7"]]);
+      }
+
+      async function errorAfterThrowing(thrown: unknown): Promise<{ core: AiCore; details: unknown[] }> {
+        fetchSpy.mockRejectedValueOnce(thrown);
+        const core = new AiCore();
+        core.provider = "openai";
+        const details: unknown[] = [];
+        core.addEventListener("ai-agent:error", (e) => details.push((e as CustomEvent).detail));
+        await expect(core.send("Hello", { model: "gpt-4o", stream: false })).resolves.toBeNull();
+        return { core, details };
+      }
+
+      function expectJsonSafeSnapshot(core: AiCore, details: unknown[], thrown: unknown): void {
+        expect(core.error).not.toBe(thrown);
+        expect(Object.getPrototypeOf(core.error)).toBe(Object.prototype);
+        expect(describeNonJsonValue(core.error)).toBeNull();
+        expect(details.at(-1)).toBe(core.error);
+        expect(core.loading).toBe(false);
+        expect(core.messages).toEqual([]);
+      }
+
+      it("Responseオブジェクト", async () => {
+        const thrown = new Response("upstream down", {
+          status: 503,
+          statusText: "Service Unavailable",
+          headers: { "Retry-After": "5" },
+        });
+        const { core, details } = await errorAfterThrowing(thrown);
+
+        // The body is an unread stream, so it cannot become text synchronously.
+        expect(core.error).toStrictEqual({ status: 503, statusText: "Service Unavailable", body: "" });
+        expectJsonSafeSnapshot(core, details, thrown);
+      });
+
+      it("Errorを継承しないHTTPエラークラスのインスタンス", async () => {
+        const thrown = new UpstreamHttpError();
+        const { core, details } = await errorAfterThrowing(thrown);
+
+        expect(core.error).toStrictEqual({
+          status: 429,
+          statusText: "Too Many Requests",
+          body: "slow down",
+          retryAfter: 7,
+        });
+        expectJsonSafeSnapshot(core, details, thrown);
+      });
+
+      it("undefinedキーやJSONにできない値を含むplain object", async () => {
+        const thrown = {
+          status: 500,
+          statusText: "Internal Server Error",
+          body: undefined,
+          retryAfter: undefined,
+          at: new Date(0),
+        };
+        const { core, details } = await errorAfterThrowing(thrown);
+
+        expect(core.error).toStrictEqual({ status: 500, statusText: "Internal Server Error", body: "" });
+        expect(Object.keys(core.error!)).toEqual(["status", "statusText", "body"]);
+        expectJsonSafeSnapshot(core, details, thrown);
+      });
+
+      it("非文字列のstatusText/bodyは空文字、負や非有限のretryAfterは省く", async () => {
+        const thrown = { status: 502, statusText: 502, body: { detail: "x" }, retryAfter: -1 };
+        const { core, details } = await errorAfterThrowing(thrown);
+
+        expect(core.error).toStrictEqual({ status: 502, statusText: "", body: "" });
+        expectJsonSafeSnapshot(core, details, thrown);
+      });
+
+      it("statusが有限数でなければAiHttpError扱いせずError snapshotにする", async () => {
+        const thrown = { status: Number.NaN, statusText: "?" };
+        const { core, details } = await errorAfterThrowing(thrown);
+
+        expect(core.error).toMatchObject({ name: "Error", message: "[object Object]" });
+        expect(core.error).not.toHaveProperty("status");
+        expectJsonSafeSnapshot(core, details, thrown);
+      });
+    });
   });
 
   describe("send (ストリーミング)", () => {

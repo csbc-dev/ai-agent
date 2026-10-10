@@ -13,7 +13,7 @@ export {
 export type { AiToolHandler } from "./toolRegistry.js";
 
 export type {
-  IConfig, ITagNames, IRemoteConfig,
+  IConfig, ITagNames, IRemoteConfig, AiPreSyncBehavior,
   IWritableConfig, IWritableTagNames, IWritableRemoteConfig, IAiProvider,
   AiMessage, AiUsage, AiRequestOptions, AiProviderRequest, AiStreamChunkResult,
   AiHttpError, AiSerializedError,

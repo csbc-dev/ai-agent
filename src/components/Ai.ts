@@ -191,19 +191,38 @@ export class Ai extends HTMLElement {
     // `getterFailures` "keeping the last known value" notice, etc.) through
     // this package's dev-gated channel.
     //
-    // `preSyncBehavior` is left at the @wc-bindable/remote default, which is
-    // still "eager" (through 0.10 — the planned flip to the spec-conformant
-    // "queue" has not shipped). Pre-sync setWithAck/invoke calls (an early
-    // `provider` ack, a `send()` fired right after connect) are therefore
-    // written to the transport immediately, behind the proxy's own `sync`
-    // request rather than held until the sync response. The WebSocket is FIFO
-    // and RemoteShellProxy handles frames in order, so the server still
-    // answers the sync first; what "eager" gives up is only the local
-    // rejection of a pre-sync setWithAck against a producer that turns out
-    // not to advertise `setAck` (SPEC-extensions.md § Pre-sync call state
-    // machine) — that call rejects when the sync response arrives instead.
+    // `preSyncBehavior` defaults to "queue" (config.remote.preSyncBehavior),
+    // overriding the @wc-bindable/remote default, which is still "eager"
+    // through 0.10 and documented upstream as non-conformant.
+    // SPEC-extensions.md § Pre-sync call state machine says setWithAck /
+    // invoke issued before the first `sync` response MUST be queued and
+    // replayed in call order only after that response has been processed.
+    // `<ai-agent>` issues exactly such calls whenever it is used right after
+    // connecting — the `provider` attribute ack, `el.messages = [...]`,
+    // `send()`, `abort()` — and with "eager" they reach the server before the
+    // client has validated the server at all:
+    //   - the element is removed before the sync arrives: the server still
+    //     receives the `send` (an LLM request is issued, then aborted),
+    //     although the client settled send() as disposed;
+    //   - the sync carries another declaration `protocol`: the client rejects
+    //     with WC_BINDABLE_PROTOCOL_ERROR, yet the server has already applied
+    //     `messages` and run the inference;
+    //   - the server does not advertise `setAck`: the `provider` change is
+    //     applied server-side while the client rejects it (without an
+    //     error.code) and send() refuses.
+    // With "queue" nothing but the `sync` request leaves the client until the
+    // server is known to be compatible. Against a compatible server the
+    // outcome is unchanged (RemoteShellProxy answers in frame order either
+    // way). Side effects of the queue: it is bounded by maxPreSyncQueue (1024
+    // calls → WC_BINDABLE_PRE_SYNC_QUEUE_FULL, far beyond what an element
+    // issues); a queued setWithAck (`provider` / `messages`) still times out
+    // after its default 30 s if no sync arrives, and gets a fresh 30 s for
+    // the reply once replayed; a queued send() (timeoutMs: 0) waits for the
+    // sync just as it would wait for the reply — dispose (element removal) or
+    // a transport close settles it as a transport error.
     this._proxy = createRemoteCoreProxy(AiCore.wcBindable, transport, {
       logger: remoteLogger,
+      preSyncBehavior: config.remote.preSyncBehavior,
     });
 
     // Bridge proxy events to this HTMLElement so framework adapters work
