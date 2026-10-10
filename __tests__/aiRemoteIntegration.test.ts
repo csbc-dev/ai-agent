@@ -1814,9 +1814,9 @@ describe("Remote integration", () => {
 
     /**
      * Data only the instance carries never crosses, and property frames
-     * carry declared names only. (`error` itself — the JSON-safe snapshot,
-     * including its `stack` — is the declared wire value and is checked by
-     * each test separately.)
+     * carry declared names only. (`error` itself — the JSON-safe
+     * `{ name, message }` snapshot — is the declared wire value and is
+     * checked by each test separately.)
      */
     function expectNoInstanceOnlyData(frames: ServerMessage[]): void {
       const text = JSON.stringify(frames);
@@ -1881,8 +1881,8 @@ describe("Remote integration", () => {
       expect((el.error as unknown as { requestId?: unknown }).requestId).toBeUndefined();
 
       // The failed send settles with `return null`; its failure travels only
-      // as the `error` update — the unchanged { name, message, stack } snapshot.
-      expect(errorUpdates(frames)).toEqual([{ name: "TypeError", message: "fetch failed", stack: original.stack }]);
+      // as the `error` update — the { name, message } snapshot, no stack.
+      expect(errorUpdates(frames)).toEqual([{ name: "TypeError", message: "fetch failed" }]);
 
       // A validation rejection afterwards is a `throw` frame. It leaves
       // `error` / `originalError` untouched and carries nothing of the instance.
@@ -1945,7 +1945,7 @@ describe("Remote integration", () => {
       {
         label: "Error",
         thrown: networkFailure,
-        wireError: (thrown: Error) => ({ name: "TypeError", message: "fetch failed", stack: thrown.stack }),
+        wireError: () => ({ name: "TypeError", message: "fetch failed" }),
         expectOriginal: (original, thrown) => expect(original).toBe(thrown),
       },
       {
@@ -2073,6 +2073,174 @@ describe("Remote integration", () => {
       expectNoInstanceOnlyData(frames);
 
       cleanup();
+    });
+
+    // The server's stack trace is withheld from the browser
+    // (SPEC-extensions.md § Error envelope, "Security note on `stack`").
+    describe("サーバー側のstackはブラウザへ送らない", () => {
+      const STACK_MARKER = "serverOnlyFrame_c0ffee";
+
+      /** An Error whose stack only the server may see; the marker finds it on the wire. */
+      function errorWithServerStack(): TypeError {
+        const error = new TypeError("fetch failed");
+        error.stack = `TypeError: fetch failed\n    at ${STACK_MARKER} (/srv/app/node_modules/undici/lib/fetch.js:1:1)`;
+        return error;
+      }
+
+      it("sync / update / throwのどのフレームにも載らず、core.originalErrorには残る", async () => {
+        const original = errorWithServerStack();
+        fetchSpy.mockRejectedValueOnce(original);
+
+        const { frames, rewriteServerMessage } = recordServerFrames();
+        const { el, core, shellWarnings, cleanup } = createRemoteAi({ rewriteServerMessage });
+        document.body.appendChild(el);
+        await settle();
+
+        // update: the failure is recorded while this client is connected.
+        core.provider = "openai";
+        el.setAttribute("model", "gpt-4o");
+        el.stream = false;
+        el.prompt = "Hi";
+        await expect(el.send()).resolves.toBeNull();
+        await settle();
+
+        // sync: a second client connects to the Core that holds the failure.
+        const late = recordServerFrames();
+        const wire2 = createMockTransportPair({ rewriteServerMessage: late.rewriteServerMessage });
+        const shell2 = new RemoteShellProxy(core, wire2.server);
+        const el2 = document.createElement("ai-agent") as Ai;
+        (el2 as any)._connectRemote(wire2.client);
+        document.body.appendChild(el2);
+        await settle();
+
+        // throw: a validation rejection on the first connection afterwards.
+        core.provider = null;
+        await expect(el.send()).rejects.toThrow("provider is required");
+        await settle();
+
+        const all = [...frames, ...late.frames];
+        // Every kind of frame the server sent is covered.
+        expect(all.some(m => m.type === "sync")).toBe(true);
+        expect(errorUpdates(all)).toHaveLength(1);
+        expect(all.some(m => m.type === "return")).toBe(true);
+        expect(all.some(m => m.type === "throw")).toBe(true);
+        // The server's stack is in none of them.
+        expect(JSON.stringify(all)).not.toContain(STACK_MARKER);
+        expect(errorUpdates(all)).toEqual([{ name: "TypeError", message: "fetch failed" }]);
+        const sync2 = late.frames.find((m): m is Extract<ServerMessage, { type: "sync" }> => m.type === "sync");
+        expect(sync2!.values.error).toStrictEqual({ name: "TypeError", message: "fetch failed" });
+
+        // It stays on the server.
+        expect(core.originalError).toBe(original);
+        expect(core.originalError!.stack).toContain(STACK_MARKER);
+
+        // The browser-side Errors keep name / message, not the server's stack.
+        for (const element of [el, el2]) {
+          expect(element.error).toBeInstanceOf(Error);
+          expect(element.error).toMatchObject({ name: "TypeError", message: "fetch failed" });
+          expect(String((element.error as Error).stack)).not.toContain(STACK_MARKER);
+        }
+        expect(shellWarnings).toEqual([]);
+
+        shell2.dispose();
+        el2.remove();
+        cleanup();
+      });
+    });
+
+    // A thrown value that is neither an Error nor HTTP-shaped.
+    describe("Errorでない値のthrow", () => {
+      it.each([
+        ["{ code, message }", { code: "E_UPSTREAM", message: "upstream refused" }, { name: "Error", message: "upstream refused" }],
+        ["{ name, message }", { name: "AccessDenied", message: "denied" }, { name: "AccessDenied", message: "denied" }],
+      ])("messageを持つplain object %s はel.errorに元のname / messageで届く", async (_label, thrown, expected) => {
+        fetchSpy.mockRejectedValueOnce(thrown);
+
+        const { frames, rewriteServerMessage } = recordServerFrames();
+        const { el, core, shellWarnings, cleanup } = createRemoteAi({ rewriteServerMessage });
+        document.body.appendChild(el);
+        await settle();
+
+        core.provider = "openai";
+        el.setAttribute("model", "gpt-4o");
+        el.stream = false;
+        el.prompt = "Hi";
+        await expect(el.send()).resolves.toBeNull();
+        await settle();
+
+        expect(el.error).toBeInstanceOf(Error);
+        expect(el.error).toMatchObject(expected);
+        expect(el.loading).toBe(false);
+        expect(errorUpdates(frames)).toEqual([expected]);
+        // The server keeps the Error built in its place: same name / message,
+        // no cause (as s3-uploader's toError).
+        expect(core.originalError).toBeInstanceOf(Error);
+        expect(core.originalError).toMatchObject(expected);
+        expect((core.originalError as Error & { cause?: unknown }).cause).toBeUndefined();
+        expect(JSON.stringify(frames)).not.toContain("[object Object]");
+        expect(shellWarnings).toEqual([]);
+
+        cleanup();
+      });
+
+      it("messageを持つplain objectはsync経路（後から接続したクライアント）でも元のmessageで届く", async () => {
+        fetchSpy.mockRejectedValueOnce({ code: "E_UPSTREAM", message: "upstream refused" });
+
+        const { el, core, shellWarnings, connect, cleanup } = createRemoteAi({ deferConnect: true });
+        core.provider = "openai";
+        await expect(core.send("Hi", { model: "gpt-4o", stream: false })).resolves.toBeNull();
+
+        connect();
+        document.body.appendChild(el);
+        await settle();
+
+        expect(el.error).toBeInstanceOf(Error);
+        expect(el.error).toMatchObject({ name: "Error", message: "upstream refused" });
+        expect(shellWarnings).toEqual([]);
+
+        cleanup();
+      });
+
+      const revokedProxy = (): object => {
+        const { proxy, revoke } = Proxy.revocable({}, {});
+        revoke();
+        return proxy;
+      };
+      it.each([
+        ["Object.create(null)", () => Object.create(null)],
+        ["toStringが例外を投げるobject", () => ({ toString() { throw new Error("no string form"); } })],
+        ["revokeされたProxy", revokedProxy],
+      ])("String()できない値（%s）でもsendはnullに決着し、loadingは止まる", async (_label, makeThrown) => {
+        fetchSpy.mockRejectedValueOnce(makeThrown());
+
+        const { frames, rewriteServerMessage } = recordServerFrames();
+        const { el, core, shellWarnings, cleanup } = createRemoteAi({ rewriteServerMessage });
+        document.body.appendChild(el);
+        await settle();
+        const loading: boolean[] = [];
+        el.addEventListener("ai-agent:loading-changed", (e) => loading.push((e as CustomEvent).detail));
+
+        core.provider = "openai";
+        el.setAttribute("model", "gpt-4o");
+        el.stream = false;
+        el.prompt = "Hi";
+        await expect(el.send()).resolves.toBeNull();
+        await settle();
+
+        expect(core.loading).toBe(false);
+        expect(el.loading).toBe(false);
+        expect(el.streaming).toBe(false);
+        expect(loading.at(-1)).toBe(false);
+        expect(el.error).toBeInstanceOf(Error);
+        expect(el.error).toMatchObject({ name: "Error", message: "<unstringifiable thrown value>" });
+        expect(el.messages).toEqual([]);
+        // Recorded on `error`, not thrown back as a command failure.
+        expect(frames.some(m => m.type === "throw")).toBe(false);
+        expect(errorUpdates(frames)).toEqual([{ name: "Error", message: "<unstringifiable thrown value>" }]);
+        expect(shellWarnings).toEqual([]);
+
+        cleanup();
+      });
     });
   });
 });

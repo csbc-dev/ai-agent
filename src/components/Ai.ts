@@ -6,7 +6,7 @@ import {
 import type {
   IWcBindable, AiMessage, AiHttpError, AiContentPart, AiTool, AiToolChoice,
 } from "../types.js";
-import { AiCore } from "../core/AiCore.js";
+import { AiCore, inProcessErrorStack } from "../core/AiCore.js";
 import { cloneMessage } from "../core/cloneMessage.js";
 import { validateMessages } from "../core/validateMessages.js";
 import { narrowError } from "../narrowError.js";
@@ -529,6 +529,8 @@ export class Ai extends HTMLElement {
     // AiCore stores non-HTTP failures as a JSON-safe AiSerializedError
     // snapshot; present it as an Error at the element level, memoized so
     // repeated reads (and the declaration getter) return the same instance.
+    // The snapshot has no stack; the revived Error takes it from the Core's
+    // original exception, which is in this page (see _reviveError).
     const coreError = this._core?.error;
     return coreError != null ? Ai._reviveError(coreError) as AiHttpError | Error : this._errorState;
   }
@@ -939,6 +941,14 @@ export class Ai extends HTMLElement {
    * instance. Memoized per snapshot object (see `revivedErrors`) so the
    * element-level value is identity-stable across `el.error` reads and
    * bind() deliveries.
+   *
+   * `name` / `message` come from the snapshot, so they are the same in both
+   * modes. The snapshot has no `stack` (it is what a server sends to the
+   * browser). A local Core's snapshot is revived with the stack of the
+   * exception behind it (`inProcessErrorStack`): that failure happened in
+   * this page. A snapshot from the wire gets none of the server's, even when
+   * an older server still sends a `stack` field — the revived Error keeps
+   * the stack of its own construction.
    */
   private static _reviveError(value: any): any {
     if (value == null || typeof value !== "object") return value;
@@ -953,7 +963,8 @@ export class Ai extends HTMLElement {
       if (cached) return cached;
       const err = new Error(value.message);
       err.name = value.name;
-      if (value.stack) err.stack = value.stack;
+      const stack = inProcessErrorStack(value);
+      if (stack !== undefined) err.stack = stack;
       revivedErrors.set(value, err);
       return err;
     }

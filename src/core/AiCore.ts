@@ -11,7 +11,7 @@ import { AnthropicProvider } from "../providers/AnthropicProvider.js";
 import { AzureOpenAiProvider } from "../providers/AzureOpenAiProvider.js";
 import { GoogleProvider } from "../providers/GoogleProvider.js";
 import { getRegisteredTool, AiToolHandler } from "../toolRegistry.js";
-import { narrowError } from "../narrowError.js";
+import { narrowError, UNSTRINGIFIABLE_THROWN_VALUE } from "../narrowError.js";
 import { cloneMessage } from "./cloneMessage.js";
 import { validateMessages } from "./validateMessages.js";
 
@@ -57,8 +57,7 @@ interface TurnResult {
 
 /**
  * Snapshot an arbitrary `Error` into the JSON-safe `AiSerializedError` shape
- * that `AiCore.error` holds — the same `name` / `message` / `stack` fields the
- * former `AiSerializableError.toJSON()` put on the wire, and nothing else.
+ * that `AiCore.error` holds: its `name` and `message`, and nothing else.
  *
  * Why a plain object rather than an `Error` (subclass) with `toJSON`:
  * `@wc-bindable/remote` >= 0.10 validates every property value as a strict
@@ -72,21 +71,69 @@ interface TurnResult {
  * (not through a declaration getter), so the stored value itself must be
  * JSON-safe, not just the event detail.
  *
+ * `stack` is deliberately not carried. `error` is what `RemoteShellProxy`
+ * sends to the browser, an untrusted boundary, and SPEC-extensions.md
+ * § Error envelope ("Security note on `stack` and `cause`") says producers
+ * SHOULD omit `stack` there by default: a server-side trace exposes internal
+ * paths and the dependency layout to every bound client. The stack stays
+ * in-process on `originalError`; `<ai-agent>` takes it from there for a Core
+ * in the same page (see `inProcessErrorStack`).
+ *
  * The snapshot is frozen so a consumer holding `core.error` (or an event
  * detail) cannot rewrite the Core's state, and so `<ai-agent>` can memoize
  * the `Error` it revives from it by identity. The caller-owned source error is
- * never mutated. `stack` is omitted when the source has none or an empty one
- * (some callers blank it deliberately to suppress stack output), matching the
- * former `toJSON`; non-string `name` / `message` are coerced so the snapshot
- * is always a valid JsonValue.
+ * never mutated. Non-string `name` / `message` are coerced so the snapshot is
+ * always a valid JsonValue, and the fields are read defensively — `_setError`
+ * runs in the `catch` that also resets `loading`, so it must not throw.
  */
 function serializeError(source: Error): AiSerializedError {
-  const snapshot: { name: string; message: string; stack?: string } = {
-    name: typeof source.name === "string" ? source.name : "Error",
-    message: typeof source.message === "string" ? source.message : String(source.message),
-  };
-  if (typeof source.stack === "string" && source.stack !== "") snapshot.stack = source.stack;
-  return Object.freeze(snapshot);
+  let name = "Error";
+  let message: string;
+  try {
+    const raw = source.name;
+    if (typeof raw === "string") name = raw;
+  } catch {
+    // An unreadable `name` (a throwing getter): keep "Error".
+  }
+  try {
+    const raw = source.message;
+    message = typeof raw === "string" ? raw : String(raw);
+  } catch {
+    message = UNSTRINGIFIABLE_THROWN_VALUE;
+  }
+  return Object.freeze({ name, message });
+}
+
+/**
+ * Every `AiSerializedError` snapshot an `AiCore` in this JS realm has stored,
+ * mapped to the `Error` it was taken from (that Core's `originalError` when
+ * the snapshot was stored). The link lives here rather than on the snapshot,
+ * which is what `RemoteShellProxy` sends; a snapshot decoded from the wire is
+ * a new object and is never found.
+ */
+const snapshotSources = new WeakMap<object, Error>();
+
+/**
+ * The `stack` of the exception behind `snapshot`, when `snapshot` is an
+ * `AiSerializedError` that an `AiCore` in this JS realm stored; `undefined`
+ * for any other value (a snapshot decoded from the wire, an `AiHttpError`,
+ * …) or when that exception has no string `stack`.
+ *
+ * Internal (not exported from the package): `<ai-agent>` uses it so the
+ * `Error` it revives from a local Core's snapshot keeps the stack of the
+ * failure, which happened in the same page. A remote element revives the
+ * server Core's snapshot without one — the server's stack never leaves the
+ * server.
+ */
+export function inProcessErrorStack(snapshot: object): string | undefined {
+  const source = snapshotSources.get(snapshot);
+  if (source === undefined) return undefined;
+  try {
+    const { stack } = source;
+    return typeof stack === "string" ? stack : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -98,10 +145,12 @@ function serializeError(source: Error): AiSerializedError {
  *
  * - `null` → `null`.
  * - An `Error` → that instance. `narrowError` returns a thrown `Error` as-is,
- *   class / `stack` / `cause` / extra fields intact, and builds
- *   `new Error(String(value))` for a thrown value that is neither an `Error`
- *   nor HTTP-shaped. Either way it is the object `error` is the snapshot of,
- *   so `name` / `message` / `stack` agree with `error`.
+ *   class / `stack` / `cause` / extra fields intact, and builds a new `Error`
+ *   for a thrown value that is neither an `Error` nor HTTP-shaped (the
+ *   `name` / `message` of an object with a string `message`, otherwise the
+ *   value's string form; no `cause`). Either way it is the object `error` is
+ *   the snapshot of, so `name` / `message` agree with `error`, and its
+ *   `stack` is the one `error` leaves out.
  * - An `AiHttpError` → a new `Error` named `"AiHttpError"` with the message
  *   `HTTP <status> <statusText>` (`HTTP <status>` when `statusText` is
  *   empty), whose `cause` is the original value: the failed response's fields
@@ -122,6 +171,20 @@ function toOriginalError(source: unknown, narrowed: AiHttpError | Error | null):
   // non-enumerable, writable, configurable property.
   Object.defineProperty(error, "cause", { value: source, writable: true, enumerable: false, configurable: true });
   return error;
+}
+
+/**
+ * Whether a value caught by `_doSend` is the `AbortError` of a cancelled
+ * request. Never throws: `instanceof` itself throws for some thrown values
+ * (a revoked `Proxy`), and this check runs before the `catch` resets
+ * `loading` / `streaming`.
+ */
+function isAbortError(e: unknown): boolean {
+  try {
+    return e instanceof Error && e.name === "AbortError";
+  } catch {
+    return false;
+  }
 }
 
 type AiCoreError = AiHttpError | AiSerializedError | null;
@@ -207,6 +270,9 @@ export class AiCore extends EventTarget {
    * object that was thrown. For any other thrown value it is the `Error` the
    * Core stored in its place (same `name` / `message` as `error`). See
    * `toOriginalError`. `null` exactly when `error` is `null`.
+   *
+   * It is also the only place the failure's `stack` is kept: `error` leaves
+   * it out, because `error` is what reaches the browser.
    *
    * It is set before the Core dispatches `ai-agent:error`, so a listener on
    * the Core (or on the `target` it was constructed with) can read it:
@@ -332,12 +398,19 @@ export class AiCore extends EventTarget {
     // and the `update` built from this event's detail pass
     // @wc-bindable/remote's JsonValue gate (see serializeError).
     const narrowed = narrowError(error);
-    const stored: AiCoreError = narrowed instanceof Error
-      ? serializeError(narrowed)
+    let stored: AiCoreError;
+    if (narrowed instanceof Error) {
+      const snapshot = serializeError(narrowed);
+      // In-process only (see inProcessErrorStack): lets a local <ai-agent>
+      // revive the snapshot with the stack it deliberately leaves out.
+      snapshotSources.set(snapshot, narrowed);
+      stored = snapshot;
+    } else {
       // null, or an AiHttpError that narrowError has already projected onto
       // a fresh plain JsonValue object — never the thrown value itself, which
       // may be a `Response` / class instance / object with `undefined` keys.
-      : narrowed;
+      stored = narrowed;
+    }
     this._error = stored;
     // The exception itself stays in-process (`originalError`, never on the
     // wire). Set before the dispatch so an `ai-agent:error` listener can
@@ -651,7 +724,7 @@ export class AiCore extends EventTarget {
         // Loop continues: next turn will include these tool messages in history.
       }
     } catch (e: unknown) {
-      if (e instanceof Error && e.name === "AbortError") {
+      if (isAbortError(e)) {
         rollback();
         if (isCurrent()) {
           this._setStreaming(false);

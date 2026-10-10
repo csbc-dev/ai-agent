@@ -968,15 +968,18 @@ describe("Ai (remote mode)", () => {
       // wire 形: サーバー側 Core は Error ではなく JSON-safe な snapshot を保持し、
       // @wc-bindable/remote 0.10 の JsonValue 検証を通って update が届く
       // （旧来の AiSerializableError + toJSON は 0.10 では update ごと破棄される）。
+      // stack はブラウザへ送らない（サーバー側の originalError に残る）。
       expect(core.error).not.toBeInstanceOf(Error);
-      expect(core.error).toStrictEqual({ name: "TypeError", message: "Network failure", stack: source.stack });
+      expect(core.error).toStrictEqual({ name: "TypeError", message: "Network failure" });
+      expect(core.originalError).toBe(source);
 
       // 要素レベルの見え方は従来どおり: el.error は Error で、
-      // ai-agent:error の detail も同じ復元済み Error インスタンス
+      // ai-agent:error の detail も同じ復元済み Error インスタンス。
+      // サーバー側の stack は持たない。
       expect(el.error).toBeInstanceOf(Error);
       expect(el.error.name).toBe("TypeError");
       expect(el.error.message).toBe("Network failure");
-      expect(el.error.stack).toBe(source.stack);
+      expect(el.error.stack).not.toBe(source.stack);
       expect(errorEvents.at(-1)).toBe(el.error);
 
       cleanup();
