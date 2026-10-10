@@ -112,6 +112,8 @@ export class Ai extends HTMLElement {
   // Aborted, then replaced by a fresh controller, by every abort() call. A
   // send() takes the signal that is current when it is called, so abort()
   // cancels exactly the sends issued before it and none issued after it.
+  // Removing a remote element replaces it too, without aborting it: the
+  // removal settles the sends issued before it (see disconnectedCallback).
   private _sendAbort: AbortController = new AbortController();
   private _autoTriggerRegistered: boolean = false;
 
@@ -157,14 +159,18 @@ export class Ai extends HTMLElement {
     this._connectRemote(transport);
   }
 
-  /** Reset remote-synced busy state on transport failure so the UI does not stay stuck. */
-  private _resetRemoteBusyState(): void {
-    if (this._remoteValues.loading) {
-      this._remoteValues.loading = false;
+  /**
+   * Reset remote-synced busy state on transport failure so the UI does not
+   * stay stuck. `values` is the synced state to reset — by default the
+   * current one; disconnectedCallback passes the state it has just detached.
+   */
+  private _resetRemoteBusyState(values: Record<string, unknown> = this._remoteValues): void {
+    if (values.loading) {
+      values.loading = false;
       this.dispatchEvent(new CustomEvent("ai-agent:loading-changed", { detail: false, bubbles: true }));
     }
-    if (this._remoteValues.streaming) {
-      this._remoteValues.streaming = false;
+    if (values.streaming) {
+      values.streaming = false;
       this.dispatchEvent(new CustomEvent("ai-agent:streaming-changed", { detail: false, bubbles: true }));
     }
   }
@@ -647,6 +653,14 @@ export class Ai extends HTMLElement {
 
   async send(): Promise<string | null> {
     const abortSignal = this._sendAbort.signal;
+    // The connection this call belongs to (null in local mode). A remote
+    // send() is invoked on it even if the element is removed — or moved,
+    // which opens a new connection — while the call waits for the `provider`
+    // ack below: removal disposes it, so the invoke rejects with
+    // WC_BINDABLE_DISPOSED and the call settles as a transport failure,
+    // exactly like a send() that was already on the wire when the element
+    // was removed. It is never re-routed to a newer connection.
+    const proxy = this._proxy;
     // Wait for any in-flight provider update so we gate on the latest result,
     // not a stale error from a previously superseded attempt.
     //
@@ -664,16 +678,40 @@ export class Ai extends HTMLElement {
     // nothing was sent, loading / error / messages stay as they are. Abort
     // takes precedence over a provider failure reported by the same ack
     // (that failure still lands in `error` and blocks the next send()).
+    //
+    // Removing the element in this window disposes the proxy, which rejects
+    // the ack with WC_BINDABLE_DISPOSED. disconnectedCallback has already
+    // dropped that ack as stale — it is not a failed provider change — so
+    // the wait ends with no provider error and the invoke below settles the
+    // call on the disposed `proxy`.
     if (this._providerUpdate) {
       await settledOrAborted(this._providerUpdate, abortSignal);
       if (abortSignal.aborted) return null;
     }
     // Refuse when the current provider attribute failed to apply so that callers
     // do not silently send with a stale, previously resolved provider.
-    if (this._lastProviderError) {
-      throw this._lastProviderError;
+    const providerError = this._lastProviderError;
+    if (providerError) {
+      if (Ai._isTransportError(providerError)) {
+        // The change was not refused: the connection failed before the ack
+        // came back (closed, timed out, pre-sync queue full; classified by
+        // error.code like an invoke failure, see _isTransportError). Still
+        // refuse to send — the server may be on its previous provider — but
+        // settle the way a send() whose invoke fails like this does: resolve
+        // to null with the failure in `error` and busy state reset. The ack
+        // has already put it in `error`; dispatch it again only if something
+        // has replaced it since.
+        if (!(this._hasLocalError && this._errorState === providerError)) {
+          this._setErrorState(providerError);
+        }
+        this._resetRemoteBusyState();
+        return null;
+      }
+      // A refusal (unknown provider, server error, WC_BINDABLE_INVALID_JSON_VALUE,
+      // WC_BINDABLE_SET_ACK_UNSUPPORTED, ...): something for the caller to fix.
+      throw providerError;
     }
-    if (this._isRemote) {
+    if (proxy) {
       try {
         // Strip `handler` from tools before serialization — functions are not
         // JSON-encodable. The server resolves handlers by name from the
@@ -717,7 +755,7 @@ export class Ai extends HTMLElement {
         const temperature = this.temperature;
         const maxTokens = this.maxTokens;
         const streamOptions = this.streamOptions;
-        return await this._proxy!.invokeWithOptions("send", [omitUndefinedProperties(this._prompt), {
+        return await proxy.invokeWithOptions("send", [omitUndefinedProperties(this._prompt), {
           model: this.model,
           stream: this.stream,
           ...(temperature !== undefined ? { temperature } : {}),
@@ -822,13 +860,31 @@ export class Ai extends HTMLElement {
   }
 
   disconnectedCallback(): void {
+    let detachedValues: Record<string, unknown> | null = null;
     if (this._isRemote) {
       // Send abort to cancel any in-flight server-side inference before disposing.
       this._proxy!.invoke("abort").catch(() => {});
       this._unbind?.();
       this._unbind = null;
+      // Removal settles every send() of this connection as a transport
+      // failure (WC_BINDABLE_DISPOSED) — on the wire, queued before the sync,
+      // or still waiting for the `provider` ack; the latter through its own
+      // invoke on the disposed proxy (see send()). Two things would otherwise
+      // decide those calls differently:
+      // - The `provider` state belongs to this connection. dispose() rejects
+      //   a pending ack with WC_BINDABLE_DISPOSED, which is not a failed
+      //   provider change (re-attaching re-applies the attribute on the new
+      //   connection). Dropping the ack here makes its handlers treat it as
+      //   stale, so it neither makes the waiting send() reject nor lingers in
+      //   _lastProviderError to refuse send()s on the next connection.
+      // - An abort() after the removal must not turn those sends into aborts:
+      //   it belongs to the next connection, so they keep the old signal.
+      this._providerUpdate = null;
+      this._lastProviderError = null;
+      this._sendAbort = new AbortController();
       this._proxy!.dispose();
       this._proxy = null;
+      detachedValues = this._remoteValues;
       this._remoteValues = {};
       if (this._ws) {
         // Clear the reference first so that any close/error dispatched
@@ -844,6 +900,14 @@ export class Ai extends HTMLElement {
     if (this._autoTriggerRegistered) {
       unregisterAutoTrigger();
       this._autoTriggerRegistered = false;
+    }
+    if (detachedValues) {
+      // The getters fall back to `false` now; tell bind() consumers too, as
+      // the transport-failure contract (and a local removal, which aborts)
+      // does. send()'s own reset cannot: it runs after _remoteValues was
+      // cleared. Dispatched last, once the teardown is complete, in case a
+      // listener re-attaches the element.
+      this._resetRemoteBusyState(detachedValues);
     }
   }
 
