@@ -203,7 +203,14 @@ Since 0.10 both proxies validate every value they **send** as a strict `JsonValu
 - **Remote `send()` omits unset options with conditional spreads** (mirroring the local path). Never substitute `null`: `AiCore.send` rejects `null` for `temperature` / `maxTokens` / `maxToolRoundtrips` / `responseSchema` / `streamOptions`.
 - **`undefined`-valued properties are omitted, everything else is left for the wire validator** ([src/omitUndefinedProperties.ts](src/omitUndefinedProperties.ts)). `cloneMessage` applies it to parts / tool calls / `providerHints`, the remote `messages` setter sends `value.map(cloneMessage)`, and remote `send()` applies it to the prompt, tools, `toolChoice` and `responseSchema`. It must not coerce `Date` / `NaN` / class instances — that would reintroduce the silent reshaping 0.10 removed.
 - **`Ai._isTransportError` classifies by `error.code`, not by message.** Transport = `TERMINAL_FAILURE` / `DISPOSED` / `TIMEOUT` / `PRE_SYNC_QUEUE_FULL`. These are consumer-only codes, which the proxy re-codes to `REMOTE_THROW` when a server sends them, so a server error can never pass for a transport failure. `PROTOCOL_ERROR`, `INVALID_JSON_VALUE` and everything else is re-thrown; `ABORTED` resolves `null` without an error. The code-less fallbacks (a raw `DOMException`, the `WebSocketClientTransport:` message prefix, the `TimeoutError` name) exist only because 0.10 does not code raw transport-send failures or timeouts (upstream wc-bindable-protocol#39). Do not add message matches back.
-- **`abort()` cancels a remote `send()` still waiting for the `provider` ack on the client** (`_sendAbort`, replaced on every abort). Sending only the `abort` command is not enough: it reaches the server ahead of the `send` and is a no-op there.
+- **`abort()` cancels a remote `send()` still waiting for the `provider` ack on the client** (`_sendAbort`, replaced on every abort and on removal). Sending only the `abort` command is not enough: it reaches the server ahead of the `send` and is a no-op there.
+- **Removing the element settles every pending remote `send()` as a transport failure (`WC_BINDABLE_DISPOSED`)**, whether the call is on the wire, queued, or still waiting for the `provider` ack.
+  - `send()` captures `this._proxy` when called and always invokes on it; it is never re-routed to a newer connection.
+  - `disconnectedCallback` drops `_providerUpdate` / `_lastProviderError` and replaces `_sendAbort` without aborting it. It dispatches the loading / streaming reset from the detached values last.
+  - Do not check `this._isRemote` after the ack wait, and do not keep the provider state across a removal. Otherwise the ack's DISPOSED rejects `send()` and refuses sends on the next connection, and an `abort()` after the removal turns those calls into aborts.
+- **A failed `provider` ack is classified by `_isTransportError` too.**
+  - Transport failure (including a code-less `TimeoutError`): `send()` resolves `null` without sending, `error` is set, and the busy state is reset. Later sends are refused the same way until `provider` is set again.
+  - Anything else: `send()` rejects.
 
 ### Configuration (`config.ts`)
 
