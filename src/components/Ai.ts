@@ -28,6 +28,45 @@ import { omitUndefinedProperties } from "../omitUndefinedProperties.js";
 // failure, as they did when the Core stored the Error itself.
 const revivedErrors = new WeakMap<object, Error>();
 
+/**
+ * `error.code` values (SPEC-extensions.md § Error envelope) under which a
+ * rejected remote `send` invocation is a transport failure: the connection,
+ * not the call, failed. All four are codes the registry reserves for errors
+ * the client proxy builds itself; when one arrives in a server `throw`, the
+ * proxy replaces it with `WC_BINDABLE_REMOTE_THROW`, so a server-side error
+ * can never pass for a transport failure. See `Ai._isTransportError`.
+ */
+const TRANSPORT_ERROR_CODES: ReadonlySet<string> = new Set([
+  // The transport closed, or the proxy is in its terminal state (e.g. after a
+  // declaration protocol mismatch, for every call after the one it rejected).
+  "WC_BINDABLE_TERMINAL_FAILURE",
+  // The proxy was disposed: the element was removed.
+  "WC_BINDABLE_DISPOSED",
+  // The server did not reply within AckOptions.timeoutMs. Not seen today:
+  // send() passes timeoutMs: 0, and 0.10 does not code its timeouts yet.
+  "WC_BINDABLE_TIMEOUT",
+  // The server has not answered the initial sync and the queue of calls
+  // waiting for it is full.
+  "WC_BINDABLE_PRE_SYNC_QUEUE_FULL",
+]);
+
+/**
+ * Resolves once `promise` settles — either way; the outcome is read elsewhere
+ * — or `signal` aborts, whichever comes first. Its handlers are registered
+ * after any the caller already attached to `promise`, so those run first.
+ */
+function settledOrAborted(promise: Promise<unknown>, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const onAbort = (): void => resolve();
+    signal.addEventListener("abort", onAbort, { once: true });
+    const settled = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    promise.then(settled, settled);
+  });
+}
+
 export class Ai extends HTMLElement {
   static wcBindable: IWcBindable = {
     ...AiCore.wcBindable,
@@ -70,6 +109,10 @@ export class Ai extends HTMLElement {
   private _hasLocalError: boolean = false;
   private _lastProviderError: Error | null = null;
   private _providerUpdate: Promise<unknown> | null = null;
+  // Aborted, then replaced by a fresh controller, by every abort() call. A
+  // send() takes the signal that is current when it is called, so abort()
+  // cancels exactly the sends issued before it and none issued after it.
+  private _sendAbort: AbortController = new AbortController();
   private _autoTriggerRegistered: boolean = false;
 
   private get _isRemote(): boolean {
@@ -603,15 +646,27 @@ export class Ai extends HTMLElement {
   }
 
   async send(): Promise<string | null> {
+    const abortSignal = this._sendAbort.signal;
     // Wait for any in-flight provider update so we gate on the latest result,
     // not a stale error from a previously superseded attempt.
     //
-    // The ack.then(...) handlers in _applyProvider are registered before this
-    // await runs, so per the Promise spec their continuations execute first
-    // when ack settles — _lastProviderError is therefore guaranteed to reflect
-    // ack's outcome by the time control returns here.
+    // The ack.then(...) handlers in _applyProvider are registered before
+    // settledOrAborted's, so per the Promise spec they execute first when ack
+    // settles — _lastProviderError is therefore guaranteed to reflect ack's
+    // outcome by the time control returns here.
+    //
+    // This wait is the only point where a remote send() has been called but
+    // its `send` command has not been handed to the proxy yet. An abort() in
+    // this window cannot reach the server-side Core — nothing is running
+    // there yet, and the `abort` command would reach the server ahead of the
+    // `send` — so the call is cancelled here instead, without waiting for
+    // the ack: like an aborted local send() it resolves to null, and as
+    // nothing was sent, loading / error / messages stay as they are. Abort
+    // takes precedence over a provider failure reported by the same ack
+    // (that failure still lands in `error` and blocks the next send()).
     if (this._providerUpdate) {
-      try { await this._providerUpdate; } catch { /* error captured via _lastProviderError */ }
+      await settledOrAborted(this._providerUpdate, abortSignal);
+      if (abortSignal.aborted) return null;
     }
     // Refuse when the current provider attribute failed to apply so that callers
     // do not silently send with a stale, previously resolved provider.
@@ -681,6 +736,13 @@ export class Ai extends HTMLElement {
           ...(streamOptions !== undefined ? { streamOptions } : {}),
         }], { timeoutMs: 0 }) as string | null;
       } catch (e) {
+        if (Ai._errorCode(e) === "WC_BINDABLE_ABORTED") {
+          // A cancelled call, not a failure: the abort contract (resolves to
+          // null, `error` not set). Not produced today — the invoke above
+          // passes no AckOptions.signal — but this is the code a conformant
+          // proxy reports a signal-aborted call with.
+          return null;
+        }
         if (Ai._isTransportError(e)) {
           // Transport-level failures (disconnect, disposed proxy) are not surfaced
           // by the server's AiCore error events, so expose them through the component state.
@@ -716,7 +778,14 @@ export class Ai extends HTMLElement {
   }
 
   abort(): void {
+    // Cancel every send() still waiting to hand its `send` command to the
+    // proxy (a remote send() waiting for the `provider` ack; see send()).
+    // The fresh controller leaves a send() issued after this call unaffected.
+    this._sendAbort.abort();
+    this._sendAbort = new AbortController();
     if (this._isRemote) {
+      // A send already handed to the proxy — on the wire or in its pre-sync
+      // queue — is ahead of this command, so the server aborts it.
       this._proxy!.invoke("abort").catch(() => {});
     } else if (this._core) {
       this._core!.abort();
@@ -827,27 +896,53 @@ export class Ai extends HTMLElement {
     return value;
   }
 
+  /** The string `code` of an error (SPEC-extensions.md § Error envelope), if any. */
+  private static _errorCode(e: unknown): string | undefined {
+    if (typeof e !== "object" || e === null) return undefined;
+    // A DOMException's legacy numeric `code` is not a registry code.
+    const code = (e as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+
   /**
-   * Detect transport-level errors from RemoteCoreProxy / client transport.
-   * Server-side business errors that happen to contain substrings like
-   * "closed" or "disposed" in their messages must not match — those are
-   * re-thrown to callers like local mode.
+   * Whether a rejected remote `send` invocation is a transport failure, which
+   * send() reports through `error` (resolving to null) instead of rejecting.
+   *
+   * An error with a `code` is classified by the code alone:
+   * - transport: the codes in TRANSPORT_ERROR_CODES (TERMINAL_FAILURE,
+   *   DISPOSED, TIMEOUT, PRE_SYNC_QUEUE_FULL). Nothing about the call is
+   *   wrong; it could not be completed over this connection.
+   * - everything else is re-thrown, matching local mode, where the caller
+   *   gets a rejection for something to fix: INVALID_JSON_VALUE (an argument
+   *   is not JSON data — rejected before sending, or by the server on
+   *   receipt), PROTOCOL_ERROR (client and server speak different protocol
+   *   versions, or a wire bug: permanent, and also a code a server may send
+   *   in a `throw`, so it cannot vouch for a transport failure),
+   *   INVALID_ACK_OPTIONS (invalid call options), SET_ACK_UNSUPPORTED (never
+   *   the result of an invoke; a `provider` ack failing with it makes send()
+   *   refuse before this point), REMOTE_THROW and any code the server's Core
+   *   throws with. ABORTED is handled by send() before this check.
+   *
+   * Server-side errors without a code (AiCore.send()'s validation) must not
+   * match — not even when their message mentions "closed" or "disposed".
+   * The only code-less errors classified as transport are the two that
+   * @wc-bindable/remote 0.10 still builds without the registry code:
+   * - A throw from the transport's send() is passed through as-is — to the
+   *   call that hit it and, as the connection error, to every later call —
+   *   rather than as TERMINAL_FAILURE. With the WebSocket transport that is a
+   *   DOMException from WebSocket.send (a server error arrives as a plain
+   *   Error, never a DOMException) or WebSocketClientTransport's own Error,
+   *   which only its message prefix identifies.
+   * - An AckOptions timeout is a plain Error named "TimeoutError" rather than
+   *   one coded TIMEOUT (send() itself passes timeoutMs: 0).
+   * (A code-less server error named "TimeoutError", or whose message carries
+   * that prefix, still matches, as it always has.)
    */
   private static _isTransportError(e: unknown): boolean {
-    if (!(e instanceof Error)) return false;
-    if (e.name === "TimeoutError") return true;
-    // Raw runtime exceptions from WebSocket.send: the socket can transition
-    // to CLOSING/CLOSED after the transport's own _closed check passed but
-    // before its close listener fires, and ws.send() then throws a
-    // DOMException (usually "InvalidStateError"). Treat these as transport
-    // failures so loading/streaming state is reset instead of being re-thrown
-    // as a business error.
+    const code = Ai._errorCode(e);
+    if (code !== undefined) return TRANSPORT_ERROR_CODES.has(code);
     if (typeof DOMException !== "undefined" && e instanceof DOMException) return true;
-    const msg = e.message;
-    return (
-      msg === "RemoteCoreProxy disposed" ||
-      msg === "Transport closed" ||
-      msg.startsWith("WebSocketClientTransport:")
-    );
+    if (!(e instanceof Error)) return false;
+    return e.name === "TimeoutError" || e.message.startsWith("WebSocketClientTransport:");
   }
 }

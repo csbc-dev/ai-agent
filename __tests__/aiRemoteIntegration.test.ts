@@ -41,9 +41,11 @@ function createMockTransportPair(options: {
   client: ClientTransport;
   server: ServerTransport;
   clientSent: ClientMessage[];
+  closeClient: () => void;
 } {
   let clientHandler: ((msg: ServerMessage) => void) | null = null;
   let serverHandler: ((msg: ClientMessage) => void) | null = null;
+  let clientCloseHandler: (() => void) | null = null;
   const clientSent: ClientMessage[] = [];
   const wire = <T>(msg: T): T => JSON.parse(JSON.stringify(msg));
 
@@ -54,6 +56,8 @@ function createMockTransportPair(options: {
       if (serverHandler) Promise.resolve().then(() => serverHandler!(wire(msg)));
     },
     onMessage: (handler) => { clientHandler = handler; },
+    // `closeClient` stands in for the WebSocket closing under the proxy.
+    onClose: (handler) => { clientCloseHandler = handler; },
   };
 
   const server: ServerTransport = {
@@ -69,7 +73,7 @@ function createMockTransportPair(options: {
     onMessage: (handler) => { serverHandler = handler; },
   };
 
-  return { client, server, clientSent };
+  return { client, server, clientSent, closeClient: () => clientCloseHandler?.() };
 }
 
 function flush(): Promise<void> {
@@ -145,10 +149,11 @@ function createRemoteAi(options: {
   clientSent: ClientMessage[];
   shellWarnings: string[];
   connect: () => void;
+  closeTransport: () => void;
   cleanup: () => void;
 } {
   const core = new AiCore();
-  const { client, server, clientSent } = createMockTransportPair({
+  const { client, server, clientSent, closeClient } = createMockTransportPair({
     rewriteServerMessage: options.rewriteServerMessage,
   });
   const shellWarnings: string[] = [];
@@ -170,6 +175,7 @@ function createRemoteAi(options: {
     clientSent,
     shellWarnings,
     connect,
+    closeTransport: closeClient,
     cleanup: () => {
       shell.dispose();
       el.remove();
@@ -200,6 +206,17 @@ describe("Remote integration", () => {
     fetchSpy.mockRestore();
     document.body.innerHTML = "";
   });
+
+  const wireKinds = (sent: ClientMessage[]): string[] =>
+    sent.map(m => (m.type === "sync" ? "sync" : `${m.type}:${m.name}`));
+
+  function hangingFetchUntilAbort(): void {
+    fetchSpy.mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+      (init as RequestInit).signal?.addEventListener("abort", () => {
+        reject(new DOMException("The operation was aborted.", "AbortError"));
+      });
+    }));
+  }
 
   // -----------------------------------------------------------------------
   // Non-streaming full cycle
@@ -968,17 +985,6 @@ describe("Remote integration", () => {
   // such calls whenever it is used right after connecting: a `provider`
   // attribute ack, `el.messages = [...]`, `send()`, `abort()`.
   describe("sync応答前の操作（pre-sync queue）", () => {
-    const wireKinds = (sent: ClientMessage[]): string[] =>
-      sent.map(m => (m.type === "sync" ? "sync" : `${m.type}:${m.name}`));
-
-    function hangingFetchUntilAbort(): void {
-      fetchSpy.mockImplementation((_url, init) => new Promise((_resolve, reject) => {
-        (init as RequestInit).signal?.addEventListener("abort", () => {
-          reject(new DOMException("The operation was aborted.", "AbortError"));
-        });
-      }));
-    }
-
     it("接続直後のprovider / messages / sendはsync応答の処理後に呼び出し順で送られ、結果が一貫する", async () => {
       fetchSpy.mockResolvedValueOnce(jsonResponse({
         choices: [{ message: { content: "Answer" } }],
@@ -1212,6 +1218,246 @@ describe("Remote integration", () => {
       } finally {
         resetConfig();
       }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // abort() while send() still waits for the `provider` acknowledgement
+  // -----------------------------------------------------------------------
+  // A remote send() waits for an in-flight `provider` setWithAck before it
+  // invokes the server's `send`. An abort() in that window used to put the
+  // `abort` command on the wire ahead of the `send` (a no-op on an idle
+  // server), and the `send` then ran normally.
+  describe("providerのack待ち中のabort()", () => {
+    function answerFetch(content: string): void {
+      fetchSpy.mockResolvedValue(jsonResponse({ choices: [{ message: { content } }] }));
+    }
+
+    for (const timing of ["sync後", "sync前"] as const) {
+      it(`${timing}: ack待ちのsendはサーバーに送られず、ローカルのabortと同じくnullに決着する`, async () => {
+        answerFetch("must not run");
+
+        const { el, core, clientSent, cleanup } = createRemoteAi();
+        document.body.appendChild(el);
+        if (timing === "sync後") await settle();
+        el.setAttribute("provider", "openai");
+        el.setAttribute("model", "gpt-4o");
+        el.stream = false;
+        el.prompt = "Hi";
+        const result = el.send(); // waits for the provider ack
+        el.abort();
+
+        await expect(result).resolves.toBeNull();
+        await settle();
+
+        expect(wireKinds(clientSent)).toEqual(["sync", "set:provider", "cmd:abort"]);
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(core.provider).toBeInstanceOf(OpenAiProvider);
+        expect(core.messages).toEqual([]);
+        expect(el.messages).toEqual([]);
+        expect(el.loading).toBe(false);
+        expect(el.error).toBeNull();
+
+        cleanup();
+      });
+    }
+
+    it("ackが返らなくてもabort()の時点でnullに決着する", async () => {
+      const { el, shell, clientSent, cleanup } = createRemoteAi();
+      shell.dispose(); // the server never answers, sync included
+      document.body.appendChild(el);
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+      let settled = false;
+      const result = el.send().finally(() => { settled = true; });
+
+      await settle();
+      expect(settled).toBe(false);
+
+      el.abort();
+      await flush();
+      expect(settled).toBe(true);
+      await expect(result).resolves.toBeNull();
+      expect(wireKinds(clientSent)).toEqual(["sync"]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      cleanup();
+    });
+
+    it("abort()直後の次のsendは中断されず、それだけがサーバーで実行される", async () => {
+      fetchSpy.mockResolvedValueOnce(jsonResponse({ choices: [{ message: { content: "Second answer" } }] }));
+
+      const { el, core, clientSent, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await settle();
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.prompt = "First";
+      const first = el.send();
+      el.abort();
+      el.prompt = "Second";
+      const second = el.send(); // waits for the same provider ack
+
+      await expect(first).resolves.toBeNull();
+      await expect(second).resolves.toBe("Second answer");
+      await settle();
+
+      expect(wireKinds(clientSent)).toEqual(["sync", "set:provider", "cmd:abort", "cmd:send"]);
+      expect(sentSendArgs(clientSent)[0]).toBe("Second");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(core.messages).toEqual([
+        { role: "user", content: "Second" },
+        { role: "assistant", content: "Second answer" },
+      ]);
+      expect(el.messages).toEqual(core.messages);
+      expect(el.error).toBeNull();
+
+      cleanup();
+    });
+
+    it("abort()直後にack待ちのないsendを呼んでも中断されない", async () => {
+      answerFetch("After abort");
+
+      const { el, core, clientSent, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await settle();
+      core.provider = "openai";
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.prompt = "Hi";
+      el.abort();
+
+      await expect(el.send()).resolves.toBe("After abort");
+      expect(wireKinds(clientSent)).toEqual(["sync", "cmd:abort", "cmd:send"]);
+
+      cleanup();
+    });
+
+    it("invoke済みのsendは従来どおりabortコマンドで中断され、ack待ちのsendは送られない", async () => {
+      hangingFetchUntilAbort();
+
+      const { el, core, clientSent, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await settle();
+      core.provider = "openai";
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      el.prompt = "Running";
+      const running = el.send(); // invoked right away: no provider ack pending
+      await settle();
+      expect(el.loading).toBe(true);
+
+      el.setAttribute("provider", "openai");
+      el.prompt = "Waiting";
+      const waiting = el.send(); // waits for the provider ack
+      el.abort();
+
+      await expect(running).resolves.toBeNull();
+      await expect(waiting).resolves.toBeNull();
+      await settle();
+
+      expect(wireKinds(clientSent)).toEqual(["sync", "cmd:send", "set:provider", "cmd:abort"]);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(core.messages).toEqual([]);
+      expect(el.loading).toBe(false);
+      expect(el.error).toBeNull();
+
+      cleanup();
+    });
+
+    it("ack待ち中にabort()し、そのackが失敗してもsendはnullに決着し、失敗はel.errorに残る", async () => {
+      const { el, clientSent, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await settle();
+      el.setAttribute("provider", "no-such-provider");
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+      const result = el.send();
+      el.abort();
+
+      await expect(result).resolves.toBeNull();
+      await settle();
+      expect((el.error as Error).message).toContain('Unknown provider: "no-such-provider"');
+      expect(clientSent.some(m => m.type === "cmd" && m.name === "send")).toBe(false);
+      // The provider failure still blocks the next send().
+      await expect(el.send()).rejects.toThrow('Unknown provider: "no-such-provider"');
+
+      cleanup();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Transport failures are recognised by error.code (0.10 coded errors)
+  // -----------------------------------------------------------------------
+  describe("transport errorのerror.code判定", () => {
+    it("send中にtransportがcloseするとWC_BINDABLE_TERMINAL_FAILUREでnullに決着しloadingが戻る", async () => {
+      hangingFetchUntilAbort();
+
+      const { el, core, closeTransport, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await settle();
+      core.provider = "openai";
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+      const result = el.send();
+      await settle();
+      expect(el.loading).toBe(true);
+
+      closeTransport();
+
+      await expect(result).resolves.toBeNull();
+      expect((el.error as { code?: string } | null)?.code).toBe("WC_BINDABLE_TERMINAL_FAILURE");
+      expect(el.loading).toBe(false);
+
+      cleanup();
+    });
+
+    it("declaration protocol不一致の後のsendはWC_BINDABLE_TERMINAL_FAILUREのtransport errorとしてnullに決着する", async () => {
+      fetchSpy.mockResolvedValue(jsonResponse({ choices: [{ message: { content: "must not run" } }] }));
+
+      const { el, core, clientSent, cleanup } = createRemoteAi({
+        rewriteServerMessage: (msg) => (msg.type === "sync" && msg.declarationFingerprint
+          ? { ...msg, declarationFingerprint: { ...msg.declarationFingerprint, protocol: "wc-bindable-2" } }
+          : msg),
+      });
+      core.provider = "openai";
+      document.body.appendChild(el);
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+
+      // The call caught by the mismatch itself carries the trigger code and
+      // is re-thrown (a client/server incompatibility, not a transport glitch).
+      await expect(el.send()).rejects.toMatchObject({ code: "WC_BINDABLE_PROTOCOL_ERROR" });
+      expect(el.error).toBeNull();
+
+      // Later calls find the proxy in its terminal state.
+      await expect(el.send()).resolves.toBeNull();
+      expect((el.error as { code?: string } | null)?.code).toBe("WC_BINDABLE_TERMINAL_FAILURE");
+      expect((el.error as Error).message).toBe("RemoteCoreProxy: transport in terminal state");
+      expect(el.loading).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(wireKinds(clientSent)).toEqual(["sync"]);
+
+      cleanup();
+    });
+
+    it("pre-sync queueが満杯のときのsendはWC_BINDABLE_PRE_SYNC_QUEUE_FULLのtransport errorとしてnullに決着する", async () => {
+      const { el, shell, clientSent, cleanup } = createRemoteAi();
+      shell.dispose(); // the server never answers the sync
+      document.body.appendChild(el);
+      // 1 024 (the library's maxPreSyncQueue default) queued abort commands.
+      for (let i = 0; i < 1024; i++) el.abort();
+      el.setAttribute("model", "gpt-4o");
+      el.prompt = "Hi";
+
+      await expect(el.send()).resolves.toBeNull();
+      expect((el.error as { code?: string } | null)?.code).toBe("WC_BINDABLE_PRE_SYNC_QUEUE_FULL");
+      expect(el.loading).toBe(false);
+      expect(wireKinds(clientSent)).toEqual(["sync"]);
+
+      cleanup();
     });
   });
 });

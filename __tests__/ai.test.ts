@@ -1104,15 +1104,58 @@ describe("Ai (ai-agent)", () => {
       expect(revived.message).toBe("boom");
     });
 
-    it("transportエラー判定がclosed/disposed/timeoutのみtrueになる", () => {
-      const timeoutError = new Error("timed out");
-      timeoutError.name = "TimeoutError";
+    describe("transportエラー判定（error.code）", () => {
+      const coded = (code: string, message = "boom"): Error =>
+        Object.assign(new Error(message), { code });
+      const named = (name: string, message: string): Error =>
+        Object.assign(new Error(message), { name });
+      const isTransport = (e: unknown): boolean => (Ai as any)._isTransportError(e);
 
-      expect((Ai as any)._isTransportError(new Error("Transport closed"))).toBe(true);
-      expect((Ai as any)._isTransportError(new Error("RemoteCoreProxy disposed"))).toBe(true);
-      expect((Ai as any)._isTransportError(timeoutError)).toBe(true);
-      expect((Ai as any)._isTransportError(new Error("provider is required"))).toBe(false);
-      expect((Ai as any)._isTransportError("closed")).toBe(false);
+      it.each([
+        "WC_BINDABLE_TERMINAL_FAILURE",
+        "WC_BINDABLE_DISPOSED",
+        "WC_BINDABLE_TIMEOUT",
+        "WC_BINDABLE_PRE_SYNC_QUEUE_FULL",
+      ])("%s はtransport error", (code) => {
+        expect(isTransport(coded(code))).toBe(true);
+      });
+
+      it.each([
+        "WC_BINDABLE_INVALID_JSON_VALUE",
+        "WC_BINDABLE_PROTOCOL_ERROR",
+        "WC_BINDABLE_INVALID_ACK_OPTIONS",
+        "WC_BINDABLE_SET_ACK_UNSUPPORTED",
+        "WC_BINDABLE_ABORTED",
+        "WC_BINDABLE_REMOTE_THROW",
+        "WC_BINDABLE_UNDECLARED_COMMAND",
+        "MYAPP_VALIDATION_FAILED",
+      ])("%s はtransport errorではない", (code) => {
+        expect(isTransport(coded(code))).toBe(false);
+      });
+
+      it("codeがあればmessage / nameに関係なくcodeだけで判定する", () => {
+        // e.g. a server error the proxy re-coded as REMOTE_THROW
+        expect(isTransport(coded("WC_BINDABLE_REMOTE_THROW", "Transport closed"))).toBe(false);
+        expect(isTransport(coded("WC_BINDABLE_REMOTE_THROW", "WebSocketClientTransport: connection is closed"))).toBe(false);
+        expect(isTransport(Object.assign(named("TimeoutError", "timed out"), { code: "WC_BINDABLE_PROTOCOL_ERROR" }))).toBe(false);
+        // 0.10 builds these two with codes; the message alone no longer counts.
+        expect(isTransport(new Error("Transport closed"))).toBe(false);
+        expect(isTransport(new Error("RemoteCoreProxy disposed"))).toBe(false);
+      });
+
+      it("codeのない生のtransport例外とcodeのないTimeoutErrorは従来どおりtransport error", () => {
+        expect(isTransport(new DOMException("Failed to execute 'send' on 'WebSocket'", "InvalidStateError"))).toBe(true);
+        expect(isTransport(new Error("WebSocketClientTransport: connection is closed"))).toBe(true);
+        expect(isTransport(named("TimeoutError", "RemoteCoreProxy: invoke(\"send\") timed out after 1ms"))).toBe(true);
+      });
+
+      it("codeのないサーバー側エラーやError以外の値はtransport errorではない", () => {
+        expect(isTransport(new Error("[@csbc-dev/ai-agent] model is required."))).toBe(false);
+        expect(isTransport(new Error("database connection closed"))).toBe(false);
+        expect(isTransport("closed")).toBe(false);
+        expect(isTransport({ code: 42 })).toBe(false);
+        expect(isTransport(null)).toBe(false);
+      });
     });
 
     it("provider以外のattributeChangedCallbackは無視する", () => {

@@ -642,6 +642,8 @@ aiEl.abort(); // Cancels streaming or pending request
 
 A new `send()` call automatically aborts any previous request.
 
+In [remote mode](#remote-mode), `abort()` also cancels a `send()` that has not been sent to the server yet — one still waiting for the server to acknowledge a `provider` change. That call is never sent: it resolves to `null` at once, and because nothing reached the server, `loading` / `error` / `messages` are left as they are. A `send()` made after the `abort()` is not affected. If that acknowledgement reports a failed `provider` change, the cancelled call still resolves to `null`; the failure is in `error` and the next `send()` refuses as usual.
+
 ### What stays in state after abort
 
 - **`messages`** — rolled back. The `{ role: "user", ... }` push from the aborted `send()` (and any tool-result / intermediate assistant turns from a tool-use loop) is removed so retry sees a clean history.
@@ -994,10 +996,10 @@ Against a compatible server the outcome is the same either way — `RemoteShellP
 
 | | Behavior |
 |---|---|
-| Queue bound | 1 024 calls per element (the library's `maxPreSyncQueue` default); a call beyond that rejects with `code: "WC_BINDABLE_PRE_SYNC_QUEUE_FULL"`. An element issues a handful. |
+| Queue bound | 1 024 calls per element (the library's `maxPreSyncQueue` default); a call beyond that fails with `code: "WC_BINDABLE_PRE_SYNC_QUEUE_FULL"` — into `el.error`, and for `send()` as a transport failure (`send()` resolves to `null`). An element issues a handful. |
 | `provider` / `messages` acks | Keep their default 30 s timeout: with no sync within 30 s they reject with a `TimeoutError` into `el.error` (a failed `provider` also makes `send()` refuse, as with any provider error). Once sent, the reply gets a fresh 30 s. |
 | `send()` | Has no timeout (`timeoutMs: 0`), so a queued `send()` waits for the sync just as it would wait for the reply. Removing the element or losing the connection settles it: `send()` resolves to `null` and `el.error` is set (transport failure). |
-| `abort()` | Queued behind a queued `send()`, so it still cancels that send on the server. |
+| `abort()` | Queued behind a queued `send()`, so it still cancels that send on the server. A `send()` still waiting for a queued `provider` ack is not queued yet; `abort()` cancels it on the client and it is never sent (see [Abort](#abort)). |
 | Element removed before the sync | Queued calls are dropped without being sent. |
 
 To get the immediate sends of earlier versions back, set `remote: { preSyncBehavior: "eager" }` (read when an element connects). It is an escape hatch — for example for a custom server that never answers `sync` — and it brings back the three cases above. `@wc-bindable/remote` documents removing its option (queue only) in 1.0; this setting will follow.
@@ -1014,7 +1016,9 @@ To get the immediate sends of earlier versions back, set `remote: { preSyncBehav
 Remote-mode failures are exposed through the same `ai-agent:error` event and `el.error` getter as local mode. Two classes of failures are surfaced locally even though they originate outside the server's `AiCore`:
 
 - **Connection failures.** Initial failure fires `ai-agent:error` with `Error("... WebSocket connection failed: <url>")`; a drop after `open` uses `"connection lost"`. If the server had synced `loading`/`streaming`=`true`, they are reset to `false` so the UI does not stay busy.
-- **Transport-layer errors during `send()`.** Timeouts, disposed proxies, and raw `DOMException` from `WebSocket.send` are treated as transport failures: `el.send()` resolves to `null`, `el.error` is populated, `loading`/`streaming` are reset. Errors thrown by the server's `AiCore.send()` before it dispatches (validation such as a missing `model`) are re-thrown to match the local-mode contract.
+- **Transport-layer errors during `send()`.** Recognised by the error's `code` ([SPEC-extensions.md § Error envelope](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/SPEC-extensions.md#error-envelope)), not its message: `"WC_BINDABLE_TERMINAL_FAILURE"` (the connection closed, or the proxy is in its terminal state — e.g. for every call after a declaration `protocol` mismatch), `"WC_BINDABLE_DISPOSED"` (the element was removed), `"WC_BINDABLE_PRE_SYNC_QUEUE_FULL"` (see [Calls made before the initial sync](#calls-made-before-the-initial-sync)) and `"WC_BINDABLE_TIMEOUT"`. Only the client proxy sets these codes — one arriving from the server is re-coded `"WC_BINDABLE_REMOTE_THROW"` — so a server-side error is never taken for a transport failure. Two failures still arrive without a code from `@wc-bindable/remote` 0.10 and are recognised as before: an exception from the transport's send (a raw `DOMException` from `WebSocket.send`, or a `WebSocketClientTransport` error) and a `TimeoutError`. For all of these, `el.send()` resolves to `null`, `el.error` is populated, `loading`/`streaming` are reset.
+
+Any other `send()` failure is re-thrown, matching the local-mode contract: errors thrown by the server's `AiCore.send()` before it dispatches (validation such as a missing `model`), a non-JSON argument (`"WC_BINDABLE_INVALID_JSON_VALUE"`, see below) and `"WC_BINDABLE_PROTOCOL_ERROR"` — client and server use different protocol versions (or a wire bug), which retrying cannot fix. A call reported as `"WC_BINDABLE_ABORTED"` resolves to `null` without an error, like any abort.
 
 Failures the server's `AiCore` records after dispatch (provider HTTP 4xx/5xx, network failures, `maxToolRoundtrips` exceeded, unparseable responses, …) behave as in local mode: `el.send()` resolves to `null` and `el.error` is populated. The Core holds non-HTTP failures as a plain `{ name, message, stack? }` snapshot (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)), and `<ai-agent>` revives it into an `Error` — both for a live update and for the initial sync of a Core that already holds an error.
 
@@ -1457,8 +1461,8 @@ A cross-cutting summary of how each failure class surfaces, consolidated from th
 
 | Channel | What reaches it |
 |---|---|
-| **Synchronous throw / promise rejection from `send()`** | Precondition violations the caller must fix: invalid `temperature` / `maxTokens` / `maxToolRoundtrips` / `provider`, empty or non-string/array `prompt`, `responseSchema` that is not a plain object, `responseSchema` + `tools` both set, Gemini + http(s) image URL. Also, in remote mode: the same validation raised by the **server's** `AiCore.send()` is re-thrown to match local-mode contract, and a `send()` argument that is not JSON data is rejected before sending (`code: "WC_BINDABLE_INVALID_JSON_VALUE"`, see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). Wrap `send()` in `try / catch` to react. |
-| **`el.error` state + `ai-agent:error` event** | Failures that originate after the request is dispatched: provider HTTP 4xx/5xx, network failures, `maxToolRoundtrips` exceeded, remote WebSocket connect failure / drop, remote transport-layer failures during `send()` (timeouts, disposed proxy, raw `DOMException`). Identical in local and remote mode. `send()` resolves to `null`; `loading` / `streaming` are reset. Bind `error` for UI — do **not** `try / catch`. |
+| **Synchronous throw / promise rejection from `send()`** | Precondition violations the caller must fix: invalid `temperature` / `maxTokens` / `maxToolRoundtrips` / `provider`, empty or non-string/array `prompt`, `responseSchema` that is not a plain object, `responseSchema` + `tools` both set, Gemini + http(s) image URL. Also, in remote mode: the same validation raised by the **server's** `AiCore.send()` is re-thrown to match local-mode contract, and a `send()` argument that is not JSON data is rejected before sending (`code: "WC_BINDABLE_INVALID_JSON_VALUE"`, see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)), as is a call that finds the client and server on different protocol versions (`code: "WC_BINDABLE_PROTOCOL_ERROR"`). Wrap `send()` in `try / catch` to react. |
+| **`el.error` state + `ai-agent:error` event** | Failures that originate after the request is dispatched: provider HTTP 4xx/5xx, network failures, `maxToolRoundtrips` exceeded, remote WebSocket connect failure / drop, remote transport-layer failures during `send()` (`code` `"WC_BINDABLE_TERMINAL_FAILURE"` / `"WC_BINDABLE_DISPOSED"` / `"WC_BINDABLE_PRE_SYNC_QUEUE_FULL"` / `"WC_BINDABLE_TIMEOUT"`, or a raw `DOMException` — see [Error surface](#error-surface)). Identical in local and remote mode. `send()` resolves to `null`; `loading` / `streaming` are reset. Bind `error` for UI — do **not** `try / catch`. |
 | **Tool message payload (`{ error: "<message>" }`)** | Handler throws and unknown tool names during the tool-use loop. The model sees the error in the next turn and typically recovers. `el.error` stays `null`; `send()` continues and resolves normally. Not directly observable from the caller — listen to `ai-agent:tool-call-completed` if you need UI hooks. |
 
 ### Per-failure reference
@@ -1476,10 +1480,12 @@ A cross-cutting summary of how each failure class surfaces, consolidated from th
 | Provider HTTP 4xx / 5xx | `el.error` | `null` | user turn rolled back | `AiHttpError` |
 | Non-`Error` thrown with numeric `status` + `statusText` (a `Response`, an HTTP-error class, …) | `el.error` | `null` | rolled back for this send() | `AiHttpError` (plain projection) |
 | Abort (`abort()` or new `send()`) | Neither (control signal) | `null` | rolled back | `null` (**not set**) |
+| Remote `abort()` while `send()` still waits for a `provider` ack (the call is never sent) | Neither (control signal) | `null` | unchanged | unchanged |
 | Remote WebSocket connect / drop | `el.error` | (no in-flight send) / `null` | — | `Error` |
-| Remote transport failure during `send()` (timeout, disposed proxy, raw `DOMException`) | `el.error` | `null` | rolled back | `Error` |
+| Remote transport failure during `send()` (`WC_BINDABLE_TERMINAL_FAILURE` / `_DISPOSED` / `_PRE_SYNC_QUEUE_FULL` / `_TIMEOUT`, raw `DOMException`) | `el.error` | `null` | rolled back | `Error` (with that `code`) |
 | Remote server-side validation error (thrown by the server's `AiCore.send()`) | Promise reject | rejects | unchanged | unchanged |
 | Remote `send()` argument that is not JSON data (`Date`, `NaN`, class instance, …) | Promise reject (`WC_BINDABLE_INVALID_JSON_VALUE`) | rejects | unchanged | unchanged |
+| Remote client / server protocol version mismatch | Promise reject (`WC_BINDABLE_PROTOCOL_ERROR`); later calls are transport failures (`WC_BINDABLE_TERMINAL_FAILURE`) | rejects | unchanged | unchanged |
 
 ### Quick rule of thumb
 
