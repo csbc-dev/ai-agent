@@ -253,7 +253,7 @@ npm run test:integration # build → playwright (tests/, browser integration)
 ```
 
 - Unit tests: [`__tests__/`](__tests__/) (vitest + happy-dom)
-- Integration tests: [`tests/`](tests/) ([playwright.config.ts](playwright.config.ts))
+- Integration tests: [`tests/`](tests/) ([playwright.config.ts](playwright.config.ts)). The Playwright server ([tests/integration/server.ts](tests/integration/server.ts)) runs `AiCore` from `src/server.ts` (the `/server` entry, from source) behind `withoutThrowInternals`, like `examples/remote/server`. Its `onThrow` records each pre-strip envelope on `startServer(...).thrown` instead of logging it, and the spec checks the raw `throw` frames through `page.on("websocket")`. Keep the wrapper until wc-bindable-protocol#38 is fixed, and remove it from both servers together.
 - TypeScript: [`tsconfig.json`](tsconfig.json)
 
 ### Important invariants
