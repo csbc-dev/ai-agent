@@ -187,3 +187,49 @@ test.describe("<ai-agent> removed during a remote send()", () => {
     expect(r.errorMessage).toContain('Unknown provider: "no-such-provider"');
   });
 });
+
+// The server wraps its transport in withoutThrowInternals (like
+// examples/remote/server), so a `throw` reply reaches the browser without the
+// server's stack trace or cause chain (wc-bindable-protocol#38), while the
+// stack still reaches the server's onThrow.
+test("a send() the server refuses: the throw reply carries no stack or cause", async ({ page }) => {
+  // Every `throw` reply's error as the browser received it off the WebSocket.
+  const throwReplies: unknown[] = [];
+  page.on("websocket", (ws) => {
+    ws.on("framereceived", ({ payload }) => {
+      const message = JSON.parse(String(payload));
+      if (message.type === "throw") throwReplies.push(message.error);
+    });
+  });
+  await page.goto(`http://localhost:${server.port}/element.html`);
+  await expect(page.locator("#status")).toHaveText("ready");
+
+  const r = await page.evaluate(async () => {
+    const { createAgent } = (window as any).e2e;
+    const el = createAgent({ provider: "openai" });
+    el.removeAttribute("model"); // the server-side AiCore.send() refuses: "model is required."
+    document.body.append(el);
+    const result = await el.send().then(
+      (value: unknown) => ({ value }),
+      (e: Error) => ({ error: { name: e.name, message: e.message, stack: e.stack } }),
+    );
+    el.remove();
+    return result;
+  });
+
+  // name and message still reach the browser's rejection...
+  expect(r.error.name).toBe("Error");
+  expect(r.error.message).toContain("model is required.");
+  // ...and they are all the reply carried: no stack, no cause. (AiCore's own
+  // throws carry no cause to begin with; stripping one is covered by
+  // __tests__/withoutThrowInternals.test.ts.)
+  await expect.poll(() => throwReplies).toEqual([{ name: "Error", message: r.error.message }]);
+
+  // The server saw the stack (onThrow gets the reply before stripping), and
+  // none of its frames reached the browser's rejection.
+  const onServer = server.thrown.find((e: any) => e?.message === r.error.message) as { stack?: unknown } | undefined;
+  expect(typeof onServer?.stack).toBe("string");
+  const serverFrames = String(onServer!.stack).split("\n").slice(1).map((line) => line.trim()).filter(Boolean);
+  expect(serverFrames.length).toBeGreaterThan(0);
+  for (const frame of serverFrames) expect(r.error.stack).not.toContain(frame);
+});

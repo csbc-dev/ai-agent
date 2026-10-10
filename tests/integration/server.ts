@@ -3,7 +3,9 @@
  *
  * - Serves static files (dist + test HTML) via HTTP
  * - Provides /api/ai endpoint that returns mock OpenAI-compatible responses
- * - Runs a WebSocket server with AiCore connected through RemoteShellProxy
+ * - Runs a WebSocket server with AiCore connected through RemoteShellProxy,
+ *   over a transport wrapped in withoutThrowInternals (as in
+ *   examples/remote/server)
  */
 import http from "node:http";
 import fs from "node:fs";
@@ -11,7 +13,9 @@ import path from "node:path";
 import { WebSocketServer } from "ws";
 import { RemoteShellProxy } from "@wc-bindable/remote";
 import type { ServerTransport, ServerMessage, ClientMessage } from "@wc-bindable/remote";
-import { AiCore } from "../../src/core/AiCore.js";
+// The server entry (`@csbc-dev/ai-agent/server`), from source like the rest
+// of this server: the default barrel defines <ai-agent> and cannot load in Node.
+import { AiCore, withoutThrowInternals } from "../../src/server.js";
 
 // ---------------------------------------------------------------------------
 // ws → ServerTransport adapter
@@ -73,7 +77,10 @@ function buildStreamResponse(prompt: string): string {
 export function startServer(port: number): Promise<{
   close: () => Promise<void>;
   port: number;
+  /** The error of every `throw` reply as onThrow got it: before stack / cause are stripped. */
+  thrown: unknown[];
 }> {
+  const thrown: unknown[] = [];
   return new Promise((resolve) => {
     // Repo root is two levels up from `tests/integration/`. The previous
     // `../../../../` value was a leftover from the original wc-bindable
@@ -190,7 +197,12 @@ export function startServer(port: number): Promise<{
     wss.on("connection", (ws) => {
       const core = new AiCore();
       core.provider = "openai";
-      const transport = createWsServerTransport(ws);
+      // Keep the server's stack / cause out of the `throw` replies
+      // (wc-bindable-protocol#38). onThrow records what the browser no longer
+      // receives, for the spec to check, instead of logging it.
+      const transport = withoutThrowInternals(createWsServerTransport(ws), {
+        onThrow: (error) => thrown.push(error),
+      });
       new RemoteShellProxy(core, transport);
     });
 
@@ -199,6 +211,7 @@ export function startServer(port: number): Promise<{
       const actualPort = typeof addr === "object" && addr ? addr.port : port;
       resolve({
         port: actualPort,
+        thrown,
         close: () => new Promise<void>((r) => {
           wss.close();
           server.close(() => r());
