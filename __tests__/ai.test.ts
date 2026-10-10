@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { bind } from "@wc-bindable/core";
 import { Ai } from "../src/components/Ai";
+import { AiCore } from "../src/core/AiCore";
 import { AiMessageElement } from "../src/components/AiMessage";
 import { registerComponents } from "../src/registerComponents";
 import { bootstrapAi } from "../src/bootstrapAi";
@@ -906,6 +908,96 @@ describe("Ai (ai-agent)", () => {
     });
   });
 
+  describe("error — 要素レベルの見え方（local mode）", () => {
+    // AiCore は非 HTTP エラーを JSON-safe な AiSerializedError snapshot で保持する
+    // （@wc-bindable/remote 0.10 の JsonValue 要件）。要素レベルでは従来どおり
+    // Error に見えることを、el.error と bind() の両経路で確認する。
+    function createLocalAi(): Ai {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+      return el;
+    }
+
+    it("ネットワーク障害はel.errorとbind()に同一のErrorとして届く", async () => {
+      fetchSpy.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+      const el = createLocalAi();
+
+      const bound: unknown[] = [];
+      const unbind = bind(el, (name, value) => {
+        if (name === "error") bound.push(value);
+      });
+      const rawDetails: unknown[] = [];
+      el.addEventListener("ai-agent:error", (e) => rawDetails.push((e as CustomEvent).detail));
+
+      el.prompt = "Hi";
+      await expect(el.send()).resolves.toBeNull();
+
+      const error = el.error as Error;
+      expect(error).toBeInstanceOf(Error);
+      expect(error.name).toBe("TypeError");
+      expect(error.message).toBe("Failed to fetch");
+      // 読むたびに同じインスタンス、bind() 経由の値とも同一
+      expect(el.error).toBe(error);
+      expect(bound.at(-1)).toBe(error);
+      // 生のイベント detail は Core の JSON-safe snapshot（Error ではない）
+      expect(rawDetails.at(-1)).not.toBeInstanceOf(Error);
+      expect(rawDetails.at(-1)).toMatchObject({ name: "TypeError", message: "Failed to fetch" });
+
+      unbind();
+    });
+
+    it("maxToolRoundtrips超過はel.errorにErrorとして届く", async () => {
+      let n = 0;
+      fetchSpy.mockImplementation(() => Promise.resolve(createMockResponse({
+        choices: [{
+          message: {
+            content: null,
+            tool_calls: [{ id: `call_${n++}`, type: "function", function: { name: "loop", arguments: "{}" } }],
+          },
+          finish_reason: "tool_calls",
+        }],
+      })));
+      const el = createLocalAi();
+      el.tools = [{ name: "loop", description: "", parameters: {}, handler: async () => "again" }];
+      el.maxToolRoundtrips = 1;
+
+      el.prompt = "loop";
+      await expect(el.send()).resolves.toBeNull();
+
+      expect(el.error).toBeInstanceOf(Error);
+      expect((el.error as Error).message).toContain("maxToolRoundtrips (1) exceeded");
+      expect(el.messages).toEqual([]);
+    });
+
+    it("HTTPエラーはgetterを通ってもAiHttpErrorのplain objectのまま", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse("Unauthorized", { status: 401, ok: false }));
+      const el = createLocalAi();
+      const bound: unknown[] = [];
+      const unbind = bind(el, (name, value) => {
+        if (name === "error") bound.push(value);
+      });
+
+      el.prompt = "Hi";
+      await el.send();
+
+      expect(el.error).not.toBeInstanceOf(Error);
+      expect((el.error as { status: number }).status).toBe(401);
+      expect(bound.at(-1)).toBe(el.error);
+      unbind();
+    });
+
+    it("errorの宣言getterはAi側だけに付き、AiCore.wcBindableは変えない", () => {
+      const shellError = Ai.wcBindable.properties.find(p => p.name === "error")!;
+      const coreError = AiCore.wcBindable.properties.find(p => p.name === "error")!;
+      expect(typeof shellError.getter).toBe("function");
+      expect(coreError.getter).toBeUndefined();
+      expect(shellError.event).toBe(coreError.event);
+    });
+  });
+
   describe("abort", () => {
     it("abort()でリクエストをキャンセルできる", () => {
       const el = document.createElement("ai-agent") as Ai;
@@ -953,6 +1045,25 @@ describe("Ai (ai-agent)", () => {
       expect(revived.name).toBe("RemoteError");
       expect(revived.message).toBe("boom");
       expect(revived.stack).toBe("stack-trace");
+    });
+
+    it("同じsnapshotからの復元は同一のErrorインスタンスを返す（memoize）", () => {
+      const snapshot = Object.freeze({ name: "TypeError", message: "boom" });
+      const first = (Ai as any)._reviveError(snapshot);
+      expect(first).toBeInstanceOf(Error);
+      expect((Ai as any)._reviveError(snapshot)).toBe(first);
+      // 別のsnapshotは別インスタンス
+      expect((Ai as any)._reviveError({ name: "TypeError", message: "boom" })).not.toBe(first);
+    });
+
+    it("Errorインスタンスは再ラップせずそのまま返す", () => {
+      const err = new RangeError("already an error");
+      expect((Ai as any)._reviveError(err)).toBe(err);
+    });
+
+    it("name/messageを持たないobjectはそのまま返す", () => {
+      const other = { foo: 1 };
+      expect((Ai as any)._reviveError(other)).toBe(other);
     });
 
     it("status付きerror objectはそのまま返す", () => {

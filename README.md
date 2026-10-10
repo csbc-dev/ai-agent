@@ -402,6 +402,10 @@ console.log("History:", core.messages);
 unbind();
 ```
 
+`core.error` is `AiHttpError | AiSerializedError | null`. A non-HTTP failure (network error, `maxToolRoundtrips` exceeded, a provider `buildRequest` throw, …) is stored as a frozen plain object `{ name, message, stack? }` — **not** an `Error` instance — so the Core's state can cross `@wc-bindable/remote` (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). Branch on `"status" in error` (HTTP) and `error.name` / `error.message`, not on `instanceof Error`. The original `name` (`"TypeError"`, `"SyntaxError"`, …) is preserved.
+
+> **Breaking change (`@wc-bindable` 0.10 upgrade).** `AiCore.error` and the `detail` of the Core's `ai-agent:error` event used to be an `Error` (an internal subclass carrying `toJSON`). They are now the plain `AiSerializedError` snapshot, because `@wc-bindable/remote` 0.10 drops any property value that is not a strict `JsonValue` — with the old shape a remote client's `error` stayed `null` for every non-HTTP failure. The element surface is unchanged: `el.error` and values delivered by `bind()` / framework adapters on `<ai-agent>` are still `Error` instances in local and remote mode. The one element-level difference is a raw `addEventListener("ai-agent:error", …)` on a **local-mode** element, whose `event.detail` is now the plain snapshot (it is dispatched by the Core); read `el.error` there if you need the `Error`.
+
 ### Custom provider
 
 ```typescript
@@ -477,7 +481,7 @@ interface AiTool {
 | `toolChoice` | `"auto" \| "none" \| { name: string }` | provider default | Force the model toward no-tool / any-tool / a specific tool. |
 | `maxToolRoundtrips` | `number` | `10` | Upper bound on consecutive tool-use rounds before the loop errors out. `0` disables tool use entirely — `tools` and `toolChoice` are stripped from the provider request, so a compliant model never sees the tool catalog and `send()` returns a plain assistant response in one round. If a non-compliant provider emits `tool_calls` regardless, those are dropped from the stored assistant message and the turn is still treated as terminal (no handler is invoked, no `maxToolRoundtrips exceeded` error). |
 
-`maxToolRoundtrips` exceeded throws an Error which is surfaced via `el.error` and rolls back the messages pushed by this `send()` call.
+`maxToolRoundtrips` exceeded throws an Error which is surfaced via `el.error` (in remote mode too) and rolls back the messages pushed by this `send()` call.
 
 ### Event surface
 
@@ -812,11 +816,18 @@ static wcBindable = {
 static wcBindable = {
   ...AiCore.wcBindable,
   properties: [
-    ...AiCore.wcBindable.properties,
+    // Same descriptors as AiCore, except that `error` gains a getter which
+    // revives the Core's JSON-safe AiSerializedError snapshot into an Error,
+    // so bind() consumers of the element see the same value as `el.error`.
+    ...AiCore.wcBindable.properties.map(p => p.name === "error"
+      ? { ...p, getter: (e) => reviveError(e.detail) }
+      : p),
     { name: "trigger", event: "ai-agent:trigger-changed" },
   ],
 };
 ```
+
+`AiCore.wcBindable` itself declares no getters: on a server, `RemoteShellProxy` builds its `update` messages from the Core's declaration, and those must carry the JSON-safe snapshot.
 
 ## Framework Integration
 
@@ -982,7 +993,28 @@ In **local mode**, the Core is created in the constructor, so setting `el.messag
 Remote-mode failures are exposed through the same `ai-agent:error` event and `el.error` getter as local mode. Two classes of failures are surfaced locally even though they originate outside the server's `AiCore`:
 
 - **Connection failures.** Initial failure fires `ai-agent:error` with `Error("... WebSocket connection failed: <url>")`; a drop after `open` uses `"connection lost"`. If the server had synced `loading`/`streaming`=`true`, they are reset to `false` so the UI does not stay busy.
-- **Transport-layer errors during `send()`.** Timeouts, disposed proxies, and raw `DOMException` from `WebSocket.send` are treated as transport failures: `el.send()` resolves to `null`, `el.error` is populated, `loading`/`streaming` are reset. Server-side business errors (validation, provider 4xx/5xx) are re-thrown to match local-mode contract.
+- **Transport-layer errors during `send()`.** Timeouts, disposed proxies, and raw `DOMException` from `WebSocket.send` are treated as transport failures: `el.send()` resolves to `null`, `el.error` is populated, `loading`/`streaming` are reset. Errors thrown by the server's `AiCore.send()` before it dispatches (validation such as a missing `model`) are re-thrown to match the local-mode contract.
+
+Failures the server's `AiCore` records after dispatch (provider HTTP 4xx/5xx, network failures, `maxToolRoundtrips` exceeded, unparseable responses, …) behave as in local mode: `el.send()` resolves to `null` and `el.error` is populated. The Core holds non-HTTP failures as a plain `{ name, message, stack? }` snapshot (see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)), and `<ai-agent>` revives it into an `Error` — both for a live update and for the initial sync of a Core that already holds an error.
+
+### Values sent over the wire (`JsonValue`)
+
+`@wc-bindable/remote` ≥ 0.10 transmits strict JSON values only — `null`, booleans, strings, finite numbers, plain arrays and plain objects — and validates them before sending instead of letting `JSON.stringify` reshape them. `Date`, `NaN` / `±Infinity`, `Map` / `Set`, class instances, functions, symbol keys, sparse arrays and nested `undefined` are rejected rather than silently converted.
+
+What `<ai-agent>` and `AiCore` handle for you:
+
+- **Unset options are omitted.** `send()` puts only the options you actually set (`temperature`, `max-tokens`, `tools`, `toolChoice`, `maxToolRoundtrips`, `responseSchema`, `responseSchemaName`, `stream-options`) into the `send` command, exactly like local mode.
+- **`undefined`-valued properties mean "absent".** In the prompt parts, tool declarations (whose `handler` is stripped as well), `toolChoice`, `responseSchema` and `el.messages = [...]`, a property whose value is `undefined` (`{ type: "image", url, mediaType: undefined }`, `toolCalls: undefined`, …) is omitted before sending — the meaning it already has in local mode. `AiCore` applies the same rule to the history it stores, so server code that assigns `core.messages` or calls `core.send()` with such fields still syncs to the browser.
+- **Core state is JSON-safe.** `AiCore.error` is an `AiHttpError` or a frozen `AiSerializedError` (`{ name, message, stack? }`), never an `Error` instance; `<ai-agent>` presents it as an `Error` (see [Error contract](#error-contract)).
+
+What stays your responsibility: put only JSON data into `el.prompt`, `el.messages`, `el.tools` (`parameters`), `el.toolChoice` and `el.responseSchema` — convert `Date`s to ISO strings, and unwrap reactive-library values that carry accessors or symbol keys (MobX `toJS()`, Vue `toRaw()`, Solid `unwrap()`). Anything else fails before it reaches the network:
+
+| Where | How a non-JSON value surfaces |
+|---|---|
+| `el.send()` (prompt, tools, `toolChoice`, `responseSchema`) | `send()` rejects with an `Error` whose `code` is `"WC_BINDABLE_INVALID_JSON_VALUE"` and whose message names the path (e.g. `args[1].responseSchema.default is Date`). Nothing is sent; `el.error`, `loading` and `messages` are unchanged. |
+| `el.messages = [...]` | `el.error` / `ai-agent:error` carry the same coded error; the server's history is unchanged. |
+
+On the server the rule applies to what the Core emits: if a custom `AiCore` subclass or provider puts a non-JSON value into a bindable property (`messages`, `usage`, …), `RemoteShellProxy` logs a warning and drops that update — or, on the initial sync, lists the property in `getterFailures` so the client keeps its last value — instead of sending it.
 
 ### `remoteCoreUrl` is required when enabled
 
@@ -1059,9 +1091,12 @@ wss.on("connection", (ws) => {
 
 Point the browser at `wss://<host>:8080/ai-agent` via `remoteCoreUrl`. Instantiate `AiCore` **per connection** — `AiCore` owns conversation history, in-flight `AbortController`, and streaming state, and must not be shared across sessions.
 
-> **`@wc-bindable/remote` ≥ 0.8.0.** This package depends on `@wc-bindable/remote ^0.8.0`; the server you wire up should resolve the same major. Three behaviors come for free with no code change:
+> **`@wc-bindable/remote` ≥ 0.10.0.** This package depends on `@wc-bindable/remote ^0.10.0`; the server you wire up should resolve the same minor (pre-1.0, a minor bump can change the wire contract — 0.10 did). What you get with no code change:
 > - **Declaration fingerprint.** The server emits a structural fingerprint of `AiCore.wcBindable` on every sync, and the client compares it to its own. A client running a mismatched `@csbc-dev/ai-agent` version is detected up front (the client logs a warning) instead of failing per message.
-> - **Capabilities negotiation** (`setAck` / `undefinedProperties` / `getterFailures`) and a **spec-conformant pre-sync queue** (`setWithAck` / `invoke` issued before the first sync are replayed in caller order rather than racing the wire).
+> - **Capabilities negotiation** (`setAck` / `undefinedProperties` / `getterFailures`).
+> - **Strict `JsonValue` wire values.** Both proxies validate every value they send instead of letting `JSON.stringify` reshape it — see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue). `AiCore` keeps all of its own state JSON-safe for this (including `error`), so a stock `new RemoteShellProxy(new AiCore(), transport)` needs nothing extra.
+>
+> `<ai-agent>` does **not** opt into the spec-conformant pre-sync queue: it leaves `RemoteCoreProxy`'s `preSyncBehavior` at the library default, which is still `"eager"` through 0.10. A `setWithAck` / `invoke` issued before the first sync (an early `provider` ack, a `send()` right after connect) is written to the socket immediately, behind the proxy's own sync request; since the WebSocket is FIFO and `RemoteShellProxy` handles frames in order, the server still answers the sync first. The one difference from `"queue"` is that a pre-sync `setWithAck` against a server that does not advertise `setAck` rejects when the sync response arrives rather than locally.
 >
 > Both `RemoteShellProxy` (server) and `RemoteCoreProxy` (client, inside `<ai-agent>`) accept an optional `logger` so the layer's diagnostics route through your own sink — `<ai-agent>` already wires one that respects this package's dev-mode gate. On the server, pass a structured logger and optionally bound memory against slow peers:
 >
@@ -1085,7 +1120,7 @@ For WebSocket servers, the simpler and safer default is a fresh `AiCore` per `co
 
 #### Injecting the provider API key server-side
 
-This is the whole reason to run remote. `<ai-agent>.send()` in remote mode forwards `{ model, apiKey, baseUrl, apiVersion, ... }` from the DOM element to the server as `send` command arguments ([components/Ai.ts:383-392](src/components/Ai.ts#L383-L392)). In a hardened deployment the browser has no `api-key` attribute, so the incoming `apiKey` is `""` — the server must override it before calling the provider:
+This is the whole reason to run remote. `<ai-agent>.send()` in remote mode forwards `{ model, stream, system, ... }` plus whichever optional settings are set from the DOM element to the server as `send` command arguments (`send()` in [components/Ai.ts](src/components/Ai.ts)); `apiKey` / `baseUrl` / `apiVersion` are included only with `forward-credentials` (see above). In a hardened deployment the incoming options therefore carry no `apiKey` — the server must supply it before calling the provider:
 
 ```ts
 class ServerAiCore extends AiCore {
@@ -1210,7 +1245,7 @@ bootstrapAi({
 import type {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions,
   AiProviderRequest, AiStreamChunkResult,
-  AiHttpError, AiAgentCoreValues, AiAgentValues,
+  AiHttpError, AiSerializedError, AiAgentCoreValues, AiAgentValues,
   AiRole, AiToolCall, AiTool, AiToolChoice, AiToolCallDelta,
   AiContent, AiContentPart, AiContentTextPart, AiContentImagePart,
 } from "@csbc-dev/ai-agent";
@@ -1267,16 +1302,24 @@ interface AiHttpError {
   retryAfter?: number;   // seconds; populated from the `Retry-After` header when present
 }
 
-interface AiAgentCoreValues {
+// Frozen JSON-safe snapshot of a non-HTTP failure, as held by AiCore.error.
+interface AiSerializedError {
+  readonly name: string;
+  readonly message: string;
+  readonly stack?: string;   // omitted when the source error had none / an empty one
+}
+
+interface AiAgentCoreValues {   // values of AiCore
   content: string;
   messages: AiMessage[];
   usage: AiUsage | null;
   loading: boolean;
   streaming: boolean;
-  error: AiHttpError | Error | null;
+  error: AiHttpError | AiSerializedError | null;
 }
 
-interface AiAgentValues extends AiAgentCoreValues {
+interface AiAgentValues extends AiAgentCoreValues {   // values of <ai-agent>
+  error: AiHttpError | Error | null;   // the element revives AiSerializedError into an Error
   trigger: boolean;
 }
 ```
@@ -1392,8 +1435,8 @@ A cross-cutting summary of how each failure class surfaces, consolidated from th
 
 | Channel | What reaches it |
 |---|---|
-| **Synchronous throw / promise rejection from `send()`** | Precondition violations the caller must fix: invalid `temperature` / `maxTokens` / `maxToolRoundtrips` / `provider`, empty or non-string/array `prompt`, `responseSchema` that is not a plain object, `responseSchema` + `tools` both set, Gemini + http(s) image URL. Also: remote-mode **server-side business errors** (provider 4xx/5xx, server validation) are re-thrown to match local-mode contract. Wrap `send()` in `try / catch` to react. |
-| **`el.error` state + `ai-agent:error` event** | Failures that originate after the request is dispatched: provider HTTP 4xx/5xx, `maxToolRoundtrips` exceeded, remote WebSocket connect failure / drop, remote transport-layer failures during `send()` (timeouts, disposed proxy, raw `DOMException`). `send()` resolves to `null`; `loading` / `streaming` are reset. Bind `error` for UI — do **not** `try / catch`. |
+| **Synchronous throw / promise rejection from `send()`** | Precondition violations the caller must fix: invalid `temperature` / `maxTokens` / `maxToolRoundtrips` / `provider`, empty or non-string/array `prompt`, `responseSchema` that is not a plain object, `responseSchema` + `tools` both set, Gemini + http(s) image URL. Also, in remote mode: the same validation raised by the **server's** `AiCore.send()` is re-thrown to match local-mode contract, and a `send()` argument that is not JSON data is rejected before sending (`code: "WC_BINDABLE_INVALID_JSON_VALUE"`, see [Values sent over the wire](#values-sent-over-the-wire-jsonvalue)). Wrap `send()` in `try / catch` to react. |
+| **`el.error` state + `ai-agent:error` event** | Failures that originate after the request is dispatched: provider HTTP 4xx/5xx, network failures, `maxToolRoundtrips` exceeded, remote WebSocket connect failure / drop, remote transport-layer failures during `send()` (timeouts, disposed proxy, raw `DOMException`). Identical in local and remote mode. `send()` resolves to `null`; `loading` / `streaming` are reset. Bind `error` for UI — do **not** `try / catch`. |
 | **Tool message payload (`{ error: "<message>" }`)** | Handler throws and unknown tool names during the tool-use loop. The model sees the error in the next turn and typically recovers. `el.error` stays `null`; `send()` continues and resolves normally. Not directly observable from the caller — listen to `ai-agent:tool-call-completed` if you need UI hooks. |
 
 ### Per-failure reference
@@ -1407,11 +1450,13 @@ A cross-cutting summary of how each failure class surfaces, consolidated from th
 | Tool handler throws | Tool message `{error}` | string (loop continues) | includes tool-error message | `null` |
 | Unknown tool name from model | Tool message `{error}` | string (loop continues) | includes tool-error message | `null` |
 | `maxToolRoundtrips` exceeded | `el.error` | `null` | rolled back for this send() | `Error` |
+| Network failure, unparseable response, provider `buildRequest` throw | `el.error` | `null` | rolled back for this send() | `Error` (original `name` kept) |
 | Provider HTTP 4xx / 5xx | `el.error` | `null` | user turn rolled back | `AiHttpError` |
 | Abort (`abort()` or new `send()`) | Neither (control signal) | `null` | rolled back | `null` (**not set**) |
 | Remote WebSocket connect / drop | `el.error` | (no in-flight send) / `null` | — | `Error` |
 | Remote transport failure during `send()` (timeout, disposed proxy, raw `DOMException`) | `el.error` | `null` | rolled back | `Error` |
-| Remote server-side business error (provider 4xx/5xx, server validation) | Promise reject | rejects | rolled back | populated |
+| Remote server-side validation error (thrown by the server's `AiCore.send()`) | Promise reject | rejects | unchanged | unchanged |
+| Remote `send()` argument that is not JSON data (`Date`, `NaN`, class instance, …) | Promise reject (`WC_BINDABLE_INVALID_JSON_VALUE`) | rejects | unchanged | unchanged |
 
 ### Quick rule of thumb
 

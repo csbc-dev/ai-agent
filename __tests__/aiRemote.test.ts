@@ -942,12 +942,16 @@ describe("Ai (remote mode)", () => {
 
   describe("error revive — リモートError復元", () => {
     it("サーバー側のErrorがリモートクライアントでもErrorインスタンスとして復元される", async () => {
-      fetchSpy.mockRejectedValueOnce(new TypeError("Network failure"));
+      const source = new TypeError("Network failure");
+      fetchSpy.mockRejectedValueOnce(source);
 
       const { el, core, cleanup } = createRemoteAi();
       document.body.appendChild(el);
       await flush();
       await flush();
+
+      const errorEvents: unknown[] = [];
+      el.addEventListener("ai-agent:error", (e: Event) => errorEvents.push((e as CustomEvent).detail));
 
       core.provider = "openai";
       el.prompt = "Hello";
@@ -961,9 +965,19 @@ describe("Ai (remote mode)", () => {
       await flush();
       await flush();
 
+      // wire 形: サーバー側 Core は Error ではなく JSON-safe な snapshot を保持し、
+      // @wc-bindable/remote 0.10 の JsonValue 検証を通って update が届く
+      // （旧来の AiSerializableError + toJSON は 0.10 では update ごと破棄される）。
+      expect(core.error).not.toBeInstanceOf(Error);
+      expect(core.error).toStrictEqual({ name: "TypeError", message: "Network failure", stack: source.stack });
+
+      // 要素レベルの見え方は従来どおり: el.error は Error で、
+      // ai-agent:error の detail も同じ復元済み Error インスタンス
       expect(el.error).toBeInstanceOf(Error);
       expect(el.error.name).toBe("TypeError");
       expect(el.error.message).toBe("Network failure");
+      expect(el.error.stack).toBe(source.stack);
+      expect(errorEvents.at(-1)).toBe(el.error);
 
       cleanup();
     });

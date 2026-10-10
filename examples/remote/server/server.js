@@ -22,8 +22,8 @@ const system = process.env.AI_SYSTEM || "";
 // AiCore subclass that injects provider credentials server-side.
 //
 // In remote mode <ai-agent> does not forward api-key / base-url to the
-// server by default, so the `options` arriving from the browser carry
-// empty credential fields. We override them here from server env. We also
+// server by default, so the `options` arriving from the browser carry no
+// credential fields. We set them here from server env. We also
 // pin `model` and `system` when configured, so the browser value (which is
 // not trusted) cannot pick a costlier model or replace the system prompt.
 class ServerAiCore extends AiCore {
@@ -77,13 +77,16 @@ wss.on("connection", (ws) => {
   core.provider = provider;
 
   const transport = new WebSocketServerTransport(ws);
-  // `logger` (a @wc-bindable/remote 0.8.0 option) routes the shell's
-  // diagnostics — dropped set/cmd frames, getter failures, send failures —
-  // through your own sink. A structured logger (pino/winston) slots in here in
-  // production; this example just prefixes console. The server also now emits a
-  // declaration fingerprint on every sync so a client running a mismatched
+  // `logger` (a @wc-bindable/remote option) routes the shell's diagnostics —
+  // dropped set/cmd frames, getter failures, send failures, and (since 0.10)
+  // property updates dropped because a value is not a strict JsonValue —
+  // through your own sink. AiCore keeps its state JSON-safe, so the last kind
+  // only appears if a custom Core / provider emits e.g. a Date or a class
+  // instance. A structured logger (pino/winston) slots in here in production;
+  // this example just prefixes console. The server also emits a declaration
+  // fingerprint on every sync so a client running a mismatched
   // @csbc-dev/ai-agent version is detected client-side instead of failing per
-  // message — no code change needed for that, it ships with 0.8.0.
+  // message — no code change needed for that.
   const shell = new RemoteShellProxy(core, transport, {
     logger: {
       warn: (msg, ...rest) => console.warn(`[ai-agent:server] ${msg}`, ...rest),

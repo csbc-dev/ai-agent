@@ -84,6 +84,22 @@ test("HTTP error propagates to error state", async ({ page }) => {
   expect(results.errorState.status).toBe(500);
 });
 
+test("non-HTTP error propagates to error state as a JSON snapshot", async ({ page }) => {
+  await page.goto(`http://localhost:${server.port}/client.html`);
+  await expect(page.locator("#status")).toHaveText("done", { timeout: 10000 });
+
+  const results = JSON.parse((await page.locator("#results").textContent())!);
+
+  expect(results.networkErrorResult).toBeNull();
+  // The server Core's error is a plain { name, message, stack? } object that
+  // crossed the real WebSocket — not the previous HTTP error left in place by
+  // a dropped update.
+  expect(results.networkErrorState).not.toBeNull();
+  expect(results.networkErrorState.name).toBe("TypeError");
+  expect(typeof results.networkErrorState.message).toBe("string");
+  expect(results.networkErrorState.status).toBeUndefined();
+});
+
 test("bind() updates include loading transitions", async ({ page }) => {
   await page.goto(`http://localhost:${server.port}/client.html`);
   await expect(page.locator("#status")).toHaveText("done", { timeout: 10000 });
